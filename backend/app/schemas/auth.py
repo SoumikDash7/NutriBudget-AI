@@ -1,4 +1,5 @@
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, ConfigDict, model_validator
+from uuid import UUID
 
 
 class RegisterRequest(BaseModel):
@@ -6,17 +7,17 @@ class RegisterRequest(BaseModel):
     phone: str | None = Field(default=None, min_length=10, max_length=15)
     password: str = Field(min_length=8, max_length=128)
 
-
-class LoginRequest(BaseModel):
-    email: EmailStr | None = None
-    phone: str | None = None
-    password: str
+    @model_validator(mode="after")
+    def validate_identifier(self):
+        if not self.email and not self.phone:
+            raise ValueError("Either email or phone must be provided.")
+        return self
 
 
 class UserResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: str
+    id: UUID
     email: str | None
     phone: str | None
     email_verified: bool
@@ -27,7 +28,7 @@ class UserResponse(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
-    token_type: str = "bearer"
+    token_type: str
 
 
 class RegisterResponse(BaseModel):
