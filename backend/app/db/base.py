@@ -7,7 +7,9 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped
 from sqlalchemy.orm import mapped_column
 
+
 from app.db.base_class import Base
+
 
 
 class BaseModel(Base):

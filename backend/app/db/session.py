@@ -13,6 +13,9 @@ engine = create_async_engine(
     echo=settings.APP_ENV == "development",
     future=True,
     pool_pre_ping=True,
+    # Required for Supabase Transaction pooler (port 6543) with asyncpg.
+    # Prepared statements are not supported across pooled connections.
+    connect_args={"prepared_statement_cache_size": 0},
 )
 
 AsyncSessionFactory = async_sessionmaker(

@@ -1,5 +1,7 @@
-from sqlalchemy import Boolean, String
-from sqlalchemy.orm import Mapped, mapped_column
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, String
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import BaseModel
 
@@ -48,4 +50,16 @@ class User(BaseModel):
         Boolean,
         default=False,
         nullable=False,
+    )
+
+    last_login: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    profile = relationship(
+        "Profile",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
     )
