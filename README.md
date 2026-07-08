@@ -152,10 +152,6 @@ This project is licensed under the MIT License.
 
 **Soumik Dash**
 
-M.Sc. Statistics | Banaras Hindu University
-
-Passionate about AI, Data Science, Health Technology, and Full-Stack Development.
-
 ---
 
 ⭐ If you find this project useful, consider giving it a star on GitHub!
