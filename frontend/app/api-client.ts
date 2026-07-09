@@ -29,10 +29,22 @@ apiClient.interceptors.request.use(
  * { message: "..." } (our custom error_response wrapper).
  */
 export function getApiError(err: any): string {
+  // No response object = network-level failure (server offline / CORS preflight killed)
+  if (!err?.response) {
+    const code: string = err?.code ?? "";
+    if (
+      code === "ERR_NETWORK" ||
+      code === "ERR_CONNECTION_REFUSED" ||
+      code === "ECONNREFUSED"
+    ) {
+      return "Cannot reach the server. Please make sure the backend is running.";
+    }
+    return "Network error. Please check your connection and try again.";
+  }
   return (
-    err?.response?.data?.detail ||
-    err?.response?.data?.message ||
-    "Something went wrong. Please try again."
+    err.response.data?.detail ||
+    err.response.data?.message ||
+    `Unexpected error (${err.response.status}). Please try again.`
   );
 }
 

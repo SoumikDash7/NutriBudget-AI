@@ -30,7 +30,7 @@ from app.services.otp_service import OTPService
 from app.core.rate_limit import InMemoryRateLimiter
 
 
-auth_rate_limiter = InMemoryRateLimiter(requests_limit=5, window_seconds=60)
+auth_rate_limiter = InMemoryRateLimiter(requests_limit=10, window_seconds=60)
 
 
 router = APIRouter(
