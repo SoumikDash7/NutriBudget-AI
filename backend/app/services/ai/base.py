@@ -8,5 +8,5 @@ class NutritionProvider(Protocol):
     supports_vision: bool
 
     async def extract(self, food_input: FoodInput, http_client: httpx.AsyncClient) -> NutritionEstimate:
-        """No internal retries — AIOrchestrator owns retry/fallback logic."""
+        """No internal retries - AIOrchestrator owns retry/fallback logic."""
         ...

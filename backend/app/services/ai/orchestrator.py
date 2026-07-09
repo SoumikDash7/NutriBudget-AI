@@ -84,7 +84,7 @@ class AIOrchestrator:
                 result = await provider.extract(food_input, http_client)
                 latency = (time.perf_counter() - start_time) * 1000
                 logger.info(
-                    f"✓ Provider '{provider.name}' succeeded in {latency:.1f}ms for {input_label}"
+                    f"OK Provider '{provider.name}' succeeded in {latency:.1f}ms for {input_label}"
                 )
                 return result
             except Exception as e:

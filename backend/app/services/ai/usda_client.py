@@ -2,7 +2,7 @@
 USDA FoodData Central API client.
 
 Free API key signup: https://fdc.nal.usda.gov/api-guide.html
-Requires USDA_API_KEY in .env — gracefully skipped if not set.
+Requires USDA_API_KEY in .env - gracefully skipped if not set.
 
 Searches the FDC database and returns the best match with macro nutrients
 normalized to a standard 100g portion.
@@ -56,7 +56,7 @@ class USDAClient(NutritionProvider):
             "pageSize": 5,
         }
 
-        logger.debug(f"GET → {_FDC_SEARCH_URL}  query='{query}'")
+        logger.debug(f"GET > {_FDC_SEARCH_URL}  query='{query}'")
         try:
             response = await http_client.get(_FDC_SEARCH_URL, params=params, timeout=8.0)
             status = response.status_code
@@ -72,7 +72,7 @@ class USDAClient(NutritionProvider):
             for food in foods:
                 parsed_data = self._parse_food(food)
                 if parsed_data:
-                    logger.info(f"✓ Found: {parsed_data['food_name']}  ({parsed_data['calories']} kcal / 100g)")
+                    logger.info(f"OK Found: {parsed_data['food_name']}  ({parsed_data['calories']} kcal / 100g)")
                     return NutritionEstimate(
                         ingredients=[
                             ExtractedIngredient(
@@ -114,7 +114,7 @@ class USDAClient(NutritionProvider):
         # Discard entries only if they are completely empty/incomplete (macros & calories are all 0)
         # Legitimate 0-calorie foods (water, diet sodas, spices) will have some valid trace details or descriptions
         if calories == 0 and protein == 0.0 and carbs == 0.0 and fat == 0.0:
-            logger.debug(f"Discarding '{name}' — completely empty USDA record (likely placeholder)")
+            logger.debug(f"Discarding '{name}' - completely empty USDA record (likely placeholder)")
             return None
 
         return {

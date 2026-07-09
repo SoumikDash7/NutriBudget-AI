@@ -24,7 +24,7 @@ _SYSTEM_PROMPT = "Return ONLY valid JSON. No markdown. No explanations. No reaso
 _USER_PROMPT_TEMPLATE = (
     "You are a professional nutrition analyst. Analyze this meal description: '{description}'. "
     "Estimate the TOTAL combined nutrition. Return ONLY a valid JSON object with "
-    "exactly these keys — no markdown, no extra text:\n"
+    "exactly these keys - no markdown, no extra text:\n"
     '{{"food_name": "<descriptive combined name>", '
     '"calories": <integer kcal>, '
     '"protein": <float grams>, '
@@ -35,7 +35,7 @@ _USER_PROMPT_TEMPLATE = (
 _VISION_PROMPT_TEMPLATE = (
     "You are a professional nutrition analyst. {context_instruction} "
     "Estimate the TOTAL combined nutrition. Return ONLY a valid JSON object with "
-    "exactly these keys — no markdown, no extra text:\n"
+    "exactly these keys - no markdown, no extra text:\n"
     '{{"food_name": "<descriptive combined name>", '
     '"calories": <integer kcal>, '
     '"protein": <float grams>, '
@@ -59,7 +59,7 @@ class GroqLlamaClient(NutritionProvider):
 
     async def extract(self, food_input: FoodInput, http_client: httpx.AsyncClient) -> NutritionEstimate:
         if not settings.GROQ_API_KEY:
-            raise ProviderAPIError("GROQ_API_KEY is not set — Groq client unavailable.")
+            raise ProviderAPIError("GROQ_API_KEY is not set - Groq client unavailable.")
 
         model = settings.GROQ_LLAMA_TEXT_MODEL
         if food_input.image_base64:
@@ -102,7 +102,7 @@ class GroqLlamaClient(NutritionProvider):
             raise ProviderAPIError("Groq free tier rate limit hit (HTTP 429).")
         if response.status_code != 200:
             raise ProviderAPIError(
-                f"Groq call failed: HTTP {response.status_code} — {response.text[:200]}"
+                f"Groq call failed: HTTP {response.status_code} - {response.text[:200]}"
             )
 
         choices = response.json().get("choices", [])
@@ -118,7 +118,7 @@ class GroqLlamaClient(NutritionProvider):
                 f"Groq returned unparseable/incomplete JSON. Raw: '{raw_text[:200]}'"
             )
 
-        logger.info(f"Groq Llama: ✓ {parsed['food_name']} ({parsed['calories']} kcal)")
+        logger.info(f"Groq Llama: OK {parsed['food_name']} ({parsed['calories']} kcal)")
         return NutritionEstimate(
             ingredients=[ExtractedIngredient(name=parsed["food_name"], quantity=1.0, unit="serving")],
             calories=float(parsed["calories"]),

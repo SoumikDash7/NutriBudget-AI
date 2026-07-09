@@ -1,7 +1,7 @@
 """
 Qwen3 client for text-based meal description parsing.
 
-Model: Qwen/Qwen3-8B (default) — configurable via QWEN3_MODEL env var.
+Model: Qwen/Qwen3-8B (default) - configurable via QWEN3_MODEL env var.
 """
 
 import httpx
@@ -113,7 +113,7 @@ class Qwen3Client(NutritionProvider):
 
         errors = []
         for provider_name, url in providers:
-            logger.debug(f"HF/{provider_name}: POST → {url}")
+            logger.debug(f"HF/{provider_name}: POST > {url}")
             try:
                 response = await self._post_with_retry(http_client, url, payload, headers)
                 http_status = response.status_code
@@ -136,7 +136,7 @@ class Qwen3Client(NutritionProvider):
                     required = {"food_name", "calories", "protein", "carbs", "fat"}
 
                     if parsed and required.issubset(parsed.keys()):
-                        logger.info(f"✓ HF/{provider_name} Parsed: {parsed['food_name']} ({parsed['calories']} kcal)")
+                        logger.info(f"OK HF/{provider_name} Parsed: {parsed['food_name']} ({parsed['calories']} kcal)")
                         
                         return NutritionEstimate(
                             ingredients=[
@@ -159,7 +159,7 @@ class Qwen3Client(NutritionProvider):
                             provider_name,
                         )
                 else:
-                    logger.warning(f"HF/{provider_name}: HTTP {http_status} — {response.text[:200]}")
+                    logger.warning(f"HF/{provider_name}: HTTP {http_status} - {response.text[:200]}")
                     errors.append(f"HTTP {http_status} from {provider_name}")
 
             except Exception as e:

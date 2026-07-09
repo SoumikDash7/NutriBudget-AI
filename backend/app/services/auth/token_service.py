@@ -19,7 +19,7 @@ class TokenService:
         try:
             payload = decode_token(refresh_token)
         except JWTError as e:
-            logger.warning(f"refresh_token: invalid JWT — {e}")
+            logger.warning(f"refresh_token: invalid JWT - {e}")
             raise ValueError("Invalid refresh token.")
 
         if payload.get("type") != "refresh":

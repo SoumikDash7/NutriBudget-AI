@@ -1,5 +1,5 @@
 """
-CalorieService — orchestrates the full AI-powered nutrition pipeline.
+CalorieService - orchestrates the full AI-powered nutrition pipeline.
 
 Image scan call order:
   1. Qwen2.5-VL via HuggingFace / Ollama (primary vision)
@@ -57,7 +57,7 @@ class OpenFoodFactsClient:
                 if data.get("status") == 1:
                     result = self._parse_product(data.get("product", {}))
                     if result:
-                        self._log.info(f"Barcode {barcode}: ✓ {result['food_name']}")
+                        self._log.info(f"Barcode {barcode}: OK {result['food_name']}")
                     else:
                         self._log.warning(f"Barcode {barcode}: product found but no nutritional data")
                     return result
@@ -263,7 +263,7 @@ class CalorieService:
         target_fat      = profile.daily_fat_target      if profile else 65.0
 
         if not profile:
-            logger.warning(f"get_dashboard: no profile found for user={user_id} — using defaults")
+            logger.warning(f"get_dashboard: no profile found for user={user_id} - using defaults")
 
         today      = date.today()
         today_logs = await self.repo.get_logs_for_date(user_id, today)
@@ -311,8 +311,8 @@ class CalorieService:
 
         Pipeline:
           1. AIOrchestrator text chain (Qwen3 -> Gemma -> Groq -> USDA)
-          2. Local DB (Indian + international) — offline database lookup fallback
-          3. Open Food Facts search — product lookup fallback
+          2. Local DB (Indian + international) - offline database lookup fallback
+          3. Open Food Facts search - product lookup fallback
         """
         logger.info(f"parse_description: '{description}'")
         desc_lower = description.lower().strip()
@@ -356,13 +356,13 @@ class CalorieService:
         except Exception as e:
             logger.warning(f"AIOrchestrator text parse failed: {e}")
 
-        logger.debug("AI orchestrator failed — falling back to databases")
+        logger.debug("AI orchestrator failed - falling back to databases")
 
         # ── 2. Local food database ────────────────────────────────────────
         logger.debug("Step 2/3: local food DB keyword match")
         for keyword, base_data in _LOCAL_FOOD_DB.items():
             if keyword in food_query:
-                logger.info(f"Step 2 ✓ Local DB: keyword='{keyword}' → {base_data['food_name']}")
+                logger.info(f"Step 2 OK Local DB: keyword='{keyword}' > {base_data['food_name']}")
                 return {
                     "food_name": f"{quantity}x {base_data['food_name']}" if quantity > 1 else base_data["food_name"],
                     "calories":  base_data["calories"] * quantity,
@@ -379,12 +379,12 @@ class CalorieService:
             off_results = await self.off_client.search_products(description)
             if off_results:
                 top = off_results[0]
-                logger.info(f"Step 3 ✓ OpenFoodFacts: {top['food_name']} ({top['calories']} kcal)")
+                logger.info(f"Step 3 OK OpenFoodFacts: {top['food_name']} ({top['calories']} kcal)")
                 return {**top, "confidence": 0.80}
             else:
                 logger.debug("Step 3: Open Food Facts returned no usable results")
         except Exception as e:
-            logger.warning(f"Step 3 ✗ Open Food Facts error: {e}")
+            logger.warning(f"Step 3 FAIL Open Food Facts error: {e}")
 
         # All parsers exhausted
         logger.error(f"All 3 text parsing steps failed for '{description}'.")
@@ -404,7 +404,7 @@ class CalorieService:
 
         Pipeline:
           1. AIOrchestrator image chain (Qwen VL -> Gemma -> Groq)
-          2. Filename heuristic — last resort
+          2. Filename heuristic - last resort
         """
         logger.info(f"scan_image: '{filename}'")
 
@@ -426,7 +426,7 @@ class CalorieService:
             result = await self.orchestrator.parse_image(base64_img, self.http_client, filename=filename)
             if result:
                 name = result.ingredients[0].name if result.ingredients else "Scanned Food"
-                logger.info(f"Step 1 ✓ Orchestrator Vision: {name} ({result.calories} kcal)")
+                logger.info(f"Step 1 OK Orchestrator Vision: {name} ({result.calories} kcal)")
                 return {
                     "food_name": name,
                     "calories": int(result.calories),
@@ -437,7 +437,7 @@ class CalorieService:
                 }
         except Exception as e:
             err_msg = f"AIOrchestrator Vision failed: {e}"
-            logger.warning(f"Step 1 ✗ {err_msg}")
+            logger.warning(f"Step 1 FAIL {err_msg}")
             errors.append(err_msg)
 
         # ── 2. Filename heuristic ──────────────────────────────────────
@@ -445,7 +445,7 @@ class CalorieService:
         heuristic_result = self._filename_heuristic(filename)
         if heuristic_result:
             logger.info(
-                f"Step 2 ✓ Heuristic: '{filename}' → "
+                f"Step 2 OK Heuristic: '{filename}' > "
                 f"{heuristic_result['food_name']} (confidence={heuristic_result['confidence']})"
             )
             return heuristic_result
@@ -486,7 +486,7 @@ class CalorieService:
         # Do not fabricate nutrition data for non-generic filenames.
         # If the AI chain failed, return None so scan_image() raises the
         # "all layers failed" error and the frontend can prompt manual entry.
-        logger.debug(f"Heuristic: no keyword match for '{filename}' — returning None")
+        logger.debug(f"Heuristic: no keyword match for '{filename}' - returning None")
         return None
 
     def _sanitize_description(self, description: str) -> str:

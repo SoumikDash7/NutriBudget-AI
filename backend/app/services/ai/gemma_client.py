@@ -22,7 +22,7 @@ _BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 _PROMPT_TEMPLATE = (
     "You are a professional nutrition analyst. {context_instruction} "
     "Estimate the TOTAL combined nutrition. Return ONLY a valid JSON object with "
-    "exactly these keys — no markdown, no extra text:\n"
+    "exactly these keys - no markdown, no extra text:\n"
     '{{"food_name": "<descriptive combined name>", '
     '"calories": <integer kcal>, '
     '"protein": <float grams>, '
@@ -46,7 +46,7 @@ class GemmaClient(NutritionProvider):
 
     async def extract(self, food_input: FoodInput, http_client: httpx.AsyncClient) -> NutritionEstimate:
         if not settings.OPENROUTER_API_KEY:
-            raise ProviderAPIError("OPENROUTER_API_KEY is not set — Gemma client unavailable.")
+            raise ProviderAPIError("OPENROUTER_API_KEY is not set - Gemma client unavailable.")
 
         model = settings.OPENROUTER_GEMMA_MODEL
 
@@ -89,7 +89,7 @@ class GemmaClient(NutritionProvider):
             raise ProviderAPIError("Gemma OpenRouter free tier rate limit hit (HTTP 429).")
         if response.status_code != 200:
             raise ProviderAPIError(
-                f"Gemma call failed: HTTP {response.status_code} — {response.text[:200]}"
+                f"Gemma call failed: HTTP {response.status_code} - {response.text[:200]}"
             )
 
         choices = response.json().get("choices", [])
@@ -105,7 +105,7 @@ class GemmaClient(NutritionProvider):
                 f"Gemma returned unparseable/incomplete JSON. Raw: '{raw_text[:200]}'"
             )
 
-        logger.info(f"Gemma: ✓ {parsed['food_name']} ({parsed['calories']} kcal)")
+        logger.info(f"Gemma: OK {parsed['food_name']} ({parsed['calories']} kcal)")
         return NutritionEstimate(
             ingredients=[ExtractedIngredient(name=parsed["food_name"], quantity=1.0, unit="serving")],
             calories=float(parsed["calories"]),

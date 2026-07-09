@@ -47,7 +47,7 @@ class RegisterService:
         # 2. Check for duplicate
         existing = await self.repo.get_by_email_or_phone(email=email, phone=phone)
         if existing:
-            logger.warning(f"Registration rejected — user already exists: '{identifier}'")
+            logger.warning(f"Registration rejected - user already exists: '{identifier}'")
             raise UserAlreadyExistsException()
 
         # 3. Create user
