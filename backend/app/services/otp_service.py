@@ -1,4 +1,4 @@
-import random
+import secrets
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,7 +16,7 @@ class OTPService:
         purpose: str = "register",
     ) -> str:
         # Generate 6-digit OTP code
-        otp_code = "".join(random.choices("0123456789", k=6))
+        otp_code = "".join(secrets.choice("0123456789") for _ in range(6))
         expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
 
         otp = OTP(
@@ -38,6 +38,8 @@ class OTPService:
 
         return otp_code
 
+    MAX_OTP_ATTEMPTS = 5
+
     async def verify_otp(
         self,
         email_or_phone: str,
@@ -49,7 +51,11 @@ class OTPService:
         if active_otp is None:
             return False
 
+        if active_otp.attempt_count >= self.MAX_OTP_ATTEMPTS:
+            return False
+
         if active_otp.otp_code != otp_code:
+            await self.repo.increment_attempt(active_otp)
             return False
 
         await self.repo.mark_verified(active_otp)

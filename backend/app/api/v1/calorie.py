@@ -1,7 +1,8 @@
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_http_client
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.calorie import (
@@ -12,11 +13,14 @@ from app.schemas.calorie import (
     FoodScanResponse,
 )
 from app.services.calorie_service import CalorieService
+from app.core.rate_limit import InMemoryRateLimiter
 
 router = APIRouter(
     prefix="/calorie",
     tags=["Calorie Calculator"],
 )
+
+ai_rate_limiter = InMemoryRateLimiter(requests_limit=10, window_seconds=60)
 
 
 @router.get(
@@ -67,8 +71,14 @@ async def parse_food_description(
     request: FoodParseRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    http_client: httpx.AsyncClient = Depends(get_http_client),
 ):
-    service = CalorieService(db)
+    if not ai_rate_limiter.is_allowed(str(current_user.id)):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Max 10 requests per minute.",
+        )
+    service = CalorieService(db, http_client=http_client)
     try:
         return await service.parse_description(request.description)
     except ValueError as e:
@@ -97,8 +107,9 @@ async def lookup_barcode(
     barcode: str,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    http_client: httpx.AsyncClient = Depends(get_http_client),
 ):
-    service = CalorieService(db)
+    service = CalorieService(db, http_client=http_client)
     product = await service.lookup_barcode(barcode)
     if product is None:
         raise HTTPException(
@@ -106,6 +117,10 @@ async def lookup_barcode(
             detail=f"Product with barcode '{barcode}' not found in Open Food Facts database."
         )
     return product
+
+
+MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+ALLOWED_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
 
 @router.post(
@@ -116,9 +131,48 @@ async def scan_food_image(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    http_client: httpx.AsyncClient = Depends(get_http_client),
 ):
-    service = CalorieService(db)
+    if not ai_rate_limiter.is_allowed(str(current_user.id)):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Max 10 requests per minute.",
+        )
+    if file.content_type not in ALLOWED_IMAGE_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported file type: {file.content_type}. Allowed: JPEG, PNG, WEBP, GIF.",
+        )
+
     file_bytes = await file.read()
+
+    # Verify actual image content via magic bytes signature
+    def is_valid_image(data: bytes) -> bool:
+        if len(data) < 12:
+            return False
+        if data[:3] == b"\xff\xd8\xff":
+            return True
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return True
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            return True
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return True
+        return False
+
+    if not is_valid_image(file_bytes):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image file format. Content does not match allowed image signatures.",
+        )
+
+    if len(file_bytes) > MAX_IMAGE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Image exceeds the 10MB upload limit.",
+        )
+
+    service = CalorieService(db, http_client=http_client)
     try:
         return await service.scan_image(file.filename, file_bytes)
     except ValueError as e:

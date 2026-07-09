@@ -22,6 +22,27 @@ class BudgetService:
         is_collaborative: bool = False,
         collaboration_id: UUID | None = None,
     ) -> BudgetTransaction:
+        collab = None
+
+        if is_collaborative and collaboration_id is None:
+            raise ValueError("collaboration_id is required when is_collaborative is True.")
+
+        if is_collaborative and collaboration_id:
+            collab = await self.repo.get_collaboration_by_id(collaboration_id)
+
+            if collab is None:
+                raise ValueError("Collaboration not found.")
+
+            if user_id not in (collab.owner_id, collab.partner_id):
+                raise ValueError(
+                    "You are not authorized to add transactions to this collaboration."
+                )
+
+            if collab.status != "accepted":
+                raise ValueError(
+                    "This collaboration invite has not been accepted yet."
+                )
+
         tx = BudgetTransaction(
             user_id=user_id,
             amount=amount,
@@ -35,9 +56,7 @@ class BudgetService:
         created_tx = await self.repo.create_transaction(tx)
 
         # Handle collaboration notifications
-        if is_collaborative and collaboration_id:
-            collab = await self.repo.get_collaboration_by_id(collaboration_id)
-            if collab and collab.status == "accepted":
+        if collab:
                 creator = await self.user_repo.get_by_id(user_id)
                 creator_name = creator.email or creator.phone or "Someone"
 
@@ -134,6 +153,10 @@ class BudgetService:
         collab_id: UUID,
         status: str,
     ) -> Collaboration:
+        _ALLOWED_STATUSES = {"accepted", "rejected"}
+        if status not in _ALLOWED_STATUSES:
+            raise ValueError(f"Invalid status '{status}'. Must be 'accepted' or 'rejected'.")
+
         collab = await self.repo.get_collaboration_by_id(collab_id)
 
         if collab is None:

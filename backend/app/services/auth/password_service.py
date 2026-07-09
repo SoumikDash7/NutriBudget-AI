@@ -1,3 +1,4 @@
+from app.core.config import settings
 from app.core.security import hash_password, verify_password
 from app.repositories.user_repository import UserRepository
 from app.services.otp_service import OTPService
@@ -57,10 +58,10 @@ class PasswordService:
             purpose="reset_password",
         )
 
-        return {
-            "message": f"OTP sent to {email_or_phone}.",
-            "otp_code": otp_code,  # returned in dev env for testing ease
-        }
+        response = {"message": f"OTP sent to {email_or_phone}."}
+        if settings.APP_ENV == "development":
+            response["otp_code"] = otp_code
+        return response
 
     async def reset_password(
         self,

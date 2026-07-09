@@ -1,6 +1,9 @@
+import logging
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_cfg_log = logging.getLogger("app.core.config")
 
 
 class Settings(BaseSettings):
@@ -21,10 +24,11 @@ class Settings(BaseSettings):
 
     ALLOWED_ORIGINS: str
     HUGGINGFACE_API_KEY: str | None = None
-    GEMINI_API_KEY: str | None = None
-    # Gemini models — AQ. key format (new auth keys from Google AI Studio)
-    GEMINI_VISION_MODEL: str = "gemini-2.5-flash"   # fast multimodal vision
-    GEMINI_TEXT_MODEL:   str = "gemini-2.5-flash"   # fast text reasoning
+    OPENROUTER_API_KEY: str | None = None
+    OPENROUTER_GEMMA_MODEL: str = "google/gemma-3-27b-it:free"
+    GROQ_API_KEY: str | None = None
+    GROQ_LLAMA_VISION_MODEL: str = "llama-3.2-11b-vision-preview"
+    GROQ_LLAMA_TEXT_MODEL: str = "llama-3.3-70b-versatile"
     # USDA FoodData Central — free key: https://fdc.nal.usda.gov/api-guide.html
     USDA_API_KEY: str | None = None
     # Qwen3 model — switch to Qwen3-30B-A3B for higher accuracy
@@ -32,7 +36,6 @@ class Settings(BaseSettings):
     # Local Ollama settings (Qwen2.5-VL runs here when Ollama is installed)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_VISION_MODEL: str = "qwen2.5vl:7b"
-
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -43,9 +46,11 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     s = Settings()
-    key_exists = s.GEMINI_API_KEY is not None and len(s.GEMINI_API_KEY) > 0
-    print(f"[Config] GEMINI_API_KEY loaded: {key_exists} (Length: {len(s.GEMINI_API_KEY) if key_exists else 0})")
+    or_key_len = len(s.OPENROUTER_API_KEY) if s.OPENROUTER_API_KEY is not None else 0
+    groq_key_len = len(s.GROQ_API_KEY) if s.GROQ_API_KEY is not None else 0
+    _cfg_log.debug(f"OPENROUTER_API_KEY loaded: {or_key_len > 0}  (length={or_key_len})")
+    _cfg_log.debug(f"GROQ_API_KEY loaded: {groq_key_len > 0}  (length={groq_key_len})")
     return s
 
 
-settings = get_settings()
+settings = get_settings()

@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Boolean, DateTime, String
+from sqlalchemy import Boolean, DateTime, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import BaseModel
@@ -33,5 +33,11 @@ class OTP(BaseModel):
     verified: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
+        nullable=False,
+    )
+
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
         nullable=False,
     )

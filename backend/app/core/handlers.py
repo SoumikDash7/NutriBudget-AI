@@ -8,6 +8,7 @@ from app.core.exceptions import (
     ProfileNotFoundException,
     UserAlreadyExistsException,
 )
+from app.services.ai.exceptions import AIOrchestrationError
 from app.utils.responses import error_response
 
 
@@ -58,6 +59,19 @@ def register_exception_handlers(app: FastAPI):
             status_code=400,
             content=error_response(
                 message=str(exc),
+            ),
+        )
+
+    @app.exception_handler(AIOrchestrationError)
+    async def ai_orchestration_handler(
+        request: Request,
+        exc: AIOrchestrationError,
+    ):
+        return JSONResponse(
+            status_code=502,
+            content=error_response(
+                message="AI analysis service is temporarily unavailable.",
+                errors={"details": str(exc)},
             ),
         )
 

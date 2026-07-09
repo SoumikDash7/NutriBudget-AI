@@ -2,38 +2,40 @@
 CalorieService — orchestrates the full AI-powered nutrition pipeline.
 
 Image scan call order:
-  1. Google Gemini 2.5 Flash Vision (primary — AQ. key format)
-  2. Google Gemini 2.5 Pro Vision   (Gemini fallback)
-  3. Qwen2.5-VL via HuggingFace     (secondary fallback)
-  4. Filename heuristic             (last resort)
+  1. Qwen2.5-VL via HuggingFace / Ollama (primary vision)
+  2. Gemma via OpenRouter                 (first fallback)
+  3. Groq Llama Vision                    (second fallback)
+  4. Filename heuristic                   (last resort)
 
 Text parse call order:
-  1. Google Gemini 2.5 Flash        (primary — AQ. key format)
-  2. Google Gemini 2.5 Pro          (Gemini fallback)
-  3. Qwen3 via HuggingFace          (secondary fallback)
-  4. USDA FoodData Central API
+  1. Qwen3 via HuggingFace         (primary)
+  2. Gemma via OpenRouter          (first fallback)
+  3. Groq Llama                    (second fallback)
+  4. USDA FoodData Central API     (third fallback)
   5. Indian + International local food DB
   6. Open Food Facts search
-  7. Generic placeholder fallback
-
-Future (not active):
-  - SAM 2 + Depth Anything V2 for portion estimation
-    (scaffold: set ENABLE_PORTION_AI=true once local server is running)
 """
 
 import re
+import base64
+import httpx
 from datetime import date, timedelta
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.logging import get_logger
 from app.models.calorie import CalorieLog
 from app.repositories.calorie_repository import CalorieRepository
 from app.repositories.profile_repository import ProfileRepository
-from app.services.ai.gemini_client import GeminiClient
 from app.services.ai.qwen_vl_client import QwenVLClient
 from app.services.ai.qwen3_client import Qwen3Client
+from app.services.ai.gemma_client import GemmaClient
+from app.services.ai.groq_llama_client import GroqLlamaClient
 from app.services.ai.usda_client import USDAClient
+from app.services.ai.orchestrator import AIOrchestrator
+
+logger = get_logger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -41,17 +43,30 @@ from app.services.ai.usda_client import USDAClient
 # ─────────────────────────────────────────────────────────────────────────────
 
 class OpenFoodFactsClient:
+    def __init__(self, http_client: httpx.AsyncClient):
+        self._client = http_client
+        self._log = get_logger(f"{__name__}.OpenFoodFacts")
+
     async def lookup_barcode(self, barcode: str) -> dict | None:
         url = f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json"
+        self._log.debug(f"Barcode lookup: {barcode}")
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=5.0)
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("status") == 1:
-                        return self._parse_product(data.get("product", {}))
+            response = await self._client.get(url, timeout=5.0)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("status") == 1:
+                    result = self._parse_product(data.get("product", {}))
+                    if result:
+                        self._log.info(f"Barcode {barcode}: ✓ {result['food_name']}")
+                    else:
+                        self._log.warning(f"Barcode {barcode}: product found but no nutritional data")
+                    return result
+                else:
+                    self._log.warning(f"Barcode {barcode}: product not found (status={data.get('status')})")
+            else:
+                self._log.warning(f"Barcode {barcode}: HTTP {response.status_code}")
         except Exception as e:
-            print(f"[OpenFoodFacts/Barcode] Error: {e}")
+            self._log.error(f"Barcode lookup failed: {e}", exc_info=True)
         return None
 
     async def search_products(self, query: str) -> list[dict]:
@@ -59,19 +74,22 @@ class OpenFoodFactsClient:
             f"https://world.openfoodfacts.org/cgi/search.pl"
             f"?search_terms={query}&search_simple=1&action=process&json=1"
         )
+        self._log.debug(f"Product search: '{query}'")
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=5.0)
-                if response.status_code == 200:
-                    data = response.json()
-                    results = []
-                    for p in data.get("products", [])[:5]:
-                        parsed = self._parse_product(p)
-                        if parsed:
-                            results.append(parsed)
-                    return results
+            response = await self._client.get(url, timeout=5.0)
+            if response.status_code == 200:
+                data    = response.json()
+                results = []
+                for p in data.get("products", [])[:5]:
+                    parsed = self._parse_product(p)
+                    if parsed:
+                        results.append(parsed)
+                self._log.info(f"Product search '{query}': found {len(results)} usable result(s)")
+                return results
+            else:
+                self._log.warning(f"Search HTTP {response.status_code}")
         except Exception as e:
-            print(f"[OpenFoodFacts/Search] Error: {e}")
+            self._log.error(f"Product search failed: {e}", exc_info=True)
         return []
 
     def _parse_product(self, product: dict) -> dict | None:
@@ -81,21 +99,21 @@ class OpenFoodFactsClient:
             or "Unknown Product"
         )
         nutriments = product.get("nutriments", {})
-        calories = nutriments.get("energy-kcal_100g")
+        calories   = nutriments.get("energy-kcal_100g")
         if calories is None:
             energy_kj = nutriments.get("energy_100g", 0)
-            calories = int(energy_kj / 4.184)
+            calories  = int(energy_kj / 4.184)
         else:
             calories = int(calories)
         protein = round(float(nutriments.get("proteins_100g", 0.0)), 1)
-        carbs = round(float(nutriments.get("carbohydrates_100g", 0.0)), 1)
-        fat = round(float(nutriments.get("fat_100g", 0.0)), 1)
+        carbs   = round(float(nutriments.get("carbohydrates_100g", 0.0)), 1)
+        fat     = round(float(nutriments.get("fat_100g", 0.0)), 1)
         return {
             "food_name": name,
-            "calories": calories,
-            "protein": protein,
-            "carbs": carbs,
-            "fat": fat,
+            "calories":  calories,
+            "protein":   protein,
+            "carbs":     carbs,
+            "fat":       fat,
         }
 
 
@@ -169,20 +187,42 @@ _LOCAL_FOOD_DB: dict[str, dict] = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CalorieService
-# ─────────────────────────────────────────────────────────────────────────────
+class _FallbackOFFClient:
+    async def lookup_barcode(self, barcode: str) -> dict | None:
+        async with httpx.AsyncClient() as client:
+            off = OpenFoodFactsClient(client)
+            return await off.lookup_barcode(barcode)
+
+    async def search_products(self, query: str) -> list[dict]:
+        async with httpx.AsyncClient() as client:
+            off = OpenFoodFactsClient(client)
+            return await off.search_products(query)
+
+
+_orchestrator_cache = None
+
+def _build_orchestrator() -> AIOrchestrator:
+    global _orchestrator_cache
+    if _orchestrator_cache is None:
+        _orchestrator_cache = AIOrchestrator(
+            qwen_vl=QwenVLClient(),
+            qwen3=Qwen3Client(),
+            gemma=GemmaClient(),
+            groq=GroqLlamaClient(),
+            usda=USDAClient()
+        )
+    return _orchestrator_cache
+
 
 class CalorieService:
 
-    def __init__(self, db: AsyncSession):
-        self.repo = CalorieRepository(db)
+    def __init__(self, db: AsyncSession, http_client: httpx.AsyncClient | None = None):
+        self.repo         = CalorieRepository(db)
         self.profile_repo = ProfileRepository(db)
-        self.off_client = OpenFoodFactsClient()
-        self.gemini = GeminiClient()
-        self.qwen_vl = QwenVLClient()
-        self.qwen3 = Qwen3Client()
-        self.usda = USDAClient()
+        self.http_client  = http_client
+        # OpenFoodFacts uses the same shared client (falls back to per-request only if client not injected)
+        self.off_client   = OpenFoodFactsClient(http_client) if http_client else _FallbackOFFClient()
+        self.orchestrator = _build_orchestrator()
 
     # ── Food Logging ──────────────────────────────────────────────────────
 
@@ -196,8 +236,7 @@ class CalorieService:
         fat: float,
         logged_date: date,
     ) -> CalorieLog:
-        # Enforce 7-day rolling window (scoped to this user)
-        await self.repo.delete_logs_older_than(user_id=user_id, days=7)
+        logger.debug(f"log_food: user={user_id}  '{food_name}'  {calories} kcal  date={logged_date}")
 
         log = CalorieLog(
             user_id=user_id,
@@ -208,20 +247,25 @@ class CalorieService:
             fat=fat,
             logged_date=logged_date,
         )
-        return await self.repo.create_log(log)
+        created = await self.repo.create_log(log)
+        logger.info(f"Food logged: '{food_name}'  {calories} kcal  (user={user_id})")
+        return created
 
     # ── Dashboard ─────────────────────────────────────────────────────────
 
     async def get_dashboard(self, user_id: UUID) -> dict:
-        await self.repo.delete_logs_older_than(user_id=user_id, days=7)
+        logger.debug(f"get_dashboard: user={user_id}")
 
-        profile = await self.profile_repo.get_by_user_id(user_id)
+        profile         = await self.profile_repo.get_by_user_id(user_id)
         target_calories = profile.daily_calorie_target if profile else 2000
         target_protein  = profile.daily_protein_target  if profile else 150.0
         target_carbs    = profile.daily_carb_target     if profile else 225.0
         target_fat      = profile.daily_fat_target      if profile else 65.0
 
-        today = date.today()
+        if not profile:
+            logger.warning(f"get_dashboard: no profile found for user={user_id} — using defaults")
+
+        today      = date.today()
         today_logs = await self.repo.get_logs_for_date(user_id, today)
 
         consumed_calories = sum(l.calories for l in today_logs)
@@ -229,8 +273,13 @@ class CalorieService:
         consumed_carbs    = sum(l.carbs    for l in today_logs)
         consumed_fat      = sum(l.fat      for l in today_logs)
 
-        past_logs = await self.repo.get_logs_past_days(user_id, days=7)
-        history_map = {today - timedelta(days=i): 0 for i in range(7)}
+        logger.debug(
+            f"Dashboard today: {consumed_calories}/{target_calories} kcal  "
+            f"({len(today_logs)} log entries)"
+        )
+
+        past_logs    = await self.repo.get_logs_past_days(user_id, days=7)
+        history_map  = {today - timedelta(days=i): 0 for i in range(7)}
         for log in past_logs:
             if log.logged_date in history_map:
                 history_map[log.logged_date] += log.calories
@@ -261,106 +310,90 @@ class CalorieService:
         Parse a text food description through a tiered AI pipeline.
 
         Pipeline:
-          1. Gemini 2.5 Flash / Pro (primary — new AQ. key format)
-          2. Qwen3 (HuggingFace) — secondary
-          3. USDA FoodData Central — real database lookup fallback
-          4. Local DB (Indian + international) — offline database lookup fallback
-          5. Open Food Facts search — product lookup fallback
+          1. AIOrchestrator text chain (Qwen3 -> Gemma -> Groq -> USDA)
+          2. Local DB (Indian + international) — offline database lookup fallback
+          3. Open Food Facts search — product lookup fallback
         """
+        logger.info(f"parse_description: '{description}'")
         desc_lower = description.lower().strip()
-        print(f"[CalorieService] parse_description triggered for: '{description}'")
 
-        # Parse optional leading quantity  e.g. "2 rotis"
-        quantity = 1
+        # Parse optional leading quantity e.g. "2 rotis"
+        quantity  = 1
         num_match = re.match(r"^(\d+)\s+(.+)$", desc_lower)
         if num_match:
-            quantity = int(num_match.group(1))
+            quantity   = int(num_match.group(1))
             food_query = num_match.group(2)
+            logger.debug(f"Quantity detected: {quantity}x '{food_query}'")
         else:
             food_query = desc_lower
 
-        errors = []
+        # ── 1. Orchestrated AI Pipeline (Qwen3 -> Gemma -> Groq -> USDA) ──
+        logger.debug("Step 1/3: AIOrchestrator text parse")
+        if not self.http_client:
+            logger.error("parse_description called without http_client")
+            raise ValueError("http_client is required for AI description parsing.")
 
-        # ── 1. Gemini 2.5 Flash / Pro (primary) ──────────────────────────
-        if settings.GEMINI_API_KEY:
-            print("[CalorieService] GEMINI_API_KEY configured. Trying Gemini text parse...")
-            try:
-                result = await self.gemini.parse_description(description)
-                if result:
-                    result["confidence"] = 0.98
-                    print(f"[CalorieService] Gemini text parse succeeded: {result['food_name']}")
-                    return result
-            except Exception as e:
-                err_msg = f"Gemini text parse failed: {str(e)}"
-                print(f"[CalorieService] {err_msg}")
-                errors.append(err_msg)
-        else:
-            msg = "Gemini API key not configured (GEMINI_API_KEY)."
-            print(f"[CalorieService] {msg}")
-            errors.append(msg)
+        sanitized_description = self._sanitize_description(description)
 
-        # ── 2. Qwen3 (HuggingFace fallback) ──────────────────────────────
-        if settings.HUGGINGFACE_API_KEY:
-            print("[CalorieService] HUGGINGFACE_API_KEY configured. Trying Qwen3 text parse...")
-            try:
-                result = await self.qwen3.parse_description(description)
-                if result:
-                    result["confidence"] = 0.96
-                    print(f"[CalorieService] Qwen3 text parse succeeded: {result['food_name']}")
-                    return result
-            except Exception as e:
-                err_msg = f"Qwen3 text parse failed: {str(e)}"
-                print(f"[CalorieService] {err_msg}")
-                errors.append(err_msg)
-        else:
-            msg = "HuggingFace API key not configured (HUGGINGFACE_API_KEY)."
-            print(f"[CalorieService] {msg}")
-            errors.append(msg)
-
-        # If both primary AI parsers failed, try database search fallbacks (which don't require AI keys)
-        print("[CalorieService] Both primary AI parsers failed. Attempting database lookups...")
-
-        # ── 3. USDA FoodData Central ──────────────────────────────────────
         try:
-            result = await self.usda.search(food_query)
+            result = await self.orchestrator.parse_text(sanitized_description, self.http_client)
             if result:
-                result["confidence"] = 0.95
-                print(f"[CalorieService] USDA database lookup succeeded: {result['food_name']}")
-                return result
-        except Exception as e:
-            print(f"[CalorieService] USDA lookup error: {e}")
+                name = result.ingredients[0].name if result.ingredients else "Unknown Food"
+                # Apply quantity scaling if detected
+                if quantity > 1:
+                    scaled_name = f"{quantity}x {name}"
+                else:
+                    scaled_name = name
 
-        # ── 4. Local food database ────────────────────────────────────────
+                return {
+                    "food_name": scaled_name,
+                    "calories": int(result.calories * quantity),
+                    "protein": round(float(result.protein_g * quantity), 1),
+                    "carbs": round(float(result.carbs_g * quantity), 1),
+                    "fat": round(float(result.fat_g * quantity), 1),
+                    "confidence": float(result.confidence),
+                }
+        except Exception as e:
+            logger.warning(f"AIOrchestrator text parse failed: {e}")
+
+        logger.debug("AI orchestrator failed — falling back to databases")
+
+        # ── 2. Local food database ────────────────────────────────────────
+        logger.debug("Step 2/3: local food DB keyword match")
         for keyword, base_data in _LOCAL_FOOD_DB.items():
             if keyword in food_query:
-                print(f"[CalorieService] Local database lookup succeeded for keyword '{keyword}'")
+                logger.info(f"Step 2 ✓ Local DB: keyword='{keyword}' → {base_data['food_name']}")
                 return {
                     "food_name": f"{quantity}x {base_data['food_name']}" if quantity > 1 else base_data["food_name"],
-                    "calories": base_data["calories"] * quantity,
-                    "protein":  round(base_data["protein"] * quantity, 1),
-                    "carbs":    round(base_data["carbs"]   * quantity, 1),
-                    "fat":      round(base_data["fat"]     * quantity, 1),
+                    "calories":  base_data["calories"] * quantity,
+                    "protein":   round(base_data["protein"] * quantity, 1),
+                    "carbs":     round(base_data["carbs"]   * quantity, 1),
+                    "fat":       round(base_data["fat"]     * quantity, 1),
                     "confidence": 0.90,
                 }
+        logger.debug("Step 2: no local DB keyword match")
 
-        # ── 5. Open Food Facts search ─────────────────────────────────────
+        # ── 3. Open Food Facts search ─────────────────────────────────────
+        logger.debug("Step 3/3: Open Food Facts product search")
         try:
             off_results = await self.off_client.search_products(description)
             if off_results:
                 top = off_results[0]
-                print(f"[CalorieService] Open Food Facts lookup succeeded: {top['food_name']}")
+                logger.info(f"Step 3 ✓ OpenFoodFacts: {top['food_name']} ({top['calories']} kcal)")
                 return {**top, "confidence": 0.80}
+            else:
+                logger.debug("Step 3: Open Food Facts returned no usable results")
         except Exception as e:
-            print(f"[CalorieService] Open Food Facts search error: {e}")
+            logger.warning(f"Step 3 ✗ Open Food Facts error: {e}")
 
-        # If we got here, all parsers and databases failed.
-        combined_error = " | ".join(errors)
-        print(f"[CalorieService] All text parsers failed. AI errors: {combined_error}")
-        raise ValueError(f"Failed to parse food description. AI errors: {combined_error}")
+        # All parsers exhausted
+        logger.error(f"All 3 text parsing steps failed for '{description}'.")
+        raise ValueError(f"Failed to parse food description '{description}'. All fallback steps failed.")
 
     # ── Barcode Lookup ────────────────────────────────────────────────────
 
     async def lookup_barcode(self, barcode: str) -> dict | None:
+        logger.info(f"lookup_barcode: '{barcode}'")
         return await self.off_client.lookup_barcode(barcode)
 
     # ── Image Scanner ─────────────────────────────────────────────────────
@@ -370,67 +403,69 @@ class CalorieService:
         Scan a food image through a tiered AI vision pipeline.
 
         Pipeline:
-          1. Gemini 2.5 Flash / Pro (primary — new AQ. key format, multimodal)
-          2. Qwen2.5-VL (HuggingFace / Ollama) — secondary fallback
+          1. AIOrchestrator image chain (Qwen VL -> Gemma -> Groq)
+          2. Filename heuristic — last resort
         """
-        print(f"[CalorieService] scan_image triggered for '{filename}'")
+        logger.info(f"scan_image: '{filename}'")
+
         if not file_bytes:
-            print("[CalorieService] Error: No file bytes received.")
+            logger.error("scan_image called with no file bytes")
             raise ValueError("No image data provided for scanning.")
 
-        print(f"[CalorieService] Image received: '{filename}' ({len(file_bytes)} bytes)")
-        
+        logger.debug(f"Image size: {len(file_bytes):,} bytes")
         errors = []
-        
-        # ── 1. Gemini 2.5 Flash / Pro (primary) ───────────────────────
-        if settings.GEMINI_API_KEY:
-            print("[CalorieService] GEMINI_API_KEY is configured. Launching Gemini Vision scan...")
-            try:
-                result = await self.gemini.scan_image(filename, file_bytes)
-                if result and "food_name" in result and "calories" in result:
-                    result["confidence"] = 0.98
-                    print(f"[CalorieService] Gemini Vision scan succeeded: {result['food_name']}")
-                    return result
-            except Exception as e:
-                err_msg = f"Gemini Vision scan failed: {str(e)}"
-                print(f"[CalorieService] {err_msg}")
-                errors.append(err_msg)
-        else:
-            msg = "Gemini API key not configured (GEMINI_API_KEY)."
-            print(f"[CalorieService] {msg}")
-            errors.append(msg)
 
-        # ── 2. Qwen2.5-VL (Fallback) ──────────────────────────────────
-        print("[CalorieService] Launching Qwen2.5-VL fallback...")
+        # ── 1. Orchestrated AI Vision (Qwen VL -> Gemma -> Groq) ──────
+        logger.debug("Step 1/2: AIOrchestrator Vision scan")
+        if not self.http_client:
+            logger.error("scan_image called without http_client")
+            raise ValueError("http_client is required for AI image scanning.")
+
+        base64_img = base64.b64encode(file_bytes).decode("utf-8")
         try:
-            result = await self.qwen_vl.scan_image(filename, file_bytes)
-            if result and "food_name" in result and "calories" in result:
-                result["confidence"] = 0.95
-                print(f"[CalorieService] Qwen2.5-VL scan succeeded: {result['food_name']}")
-                return result
-            else:
-                errors.append("Qwen2.5-VL scan returned empty/invalid result.")
+            result = await self.orchestrator.parse_image(base64_img, self.http_client, filename=filename)
+            if result:
+                name = result.ingredients[0].name if result.ingredients else "Scanned Food"
+                logger.info(f"Step 1 ✓ Orchestrator Vision: {name} ({result.calories} kcal)")
+                return {
+                    "food_name": name,
+                    "calories": int(result.calories),
+                    "protein": float(result.protein_g),
+                    "carbs": float(result.carbs_g),
+                    "fat": float(result.fat_g),
+                    "confidence": float(result.confidence),
+                }
         except Exception as e:
-            err_msg = f"Qwen2.5-VL fallback failed: {str(e)}"
-            print(f"[CalorieService] {err_msg}")
+            err_msg = f"AIOrchestrator Vision failed: {e}"
+            logger.warning(f"Step 1 ✗ {err_msg}")
             errors.append(err_msg)
 
-        # If we got here, all AI layers failed.
+        # ── 2. Filename heuristic ──────────────────────────────────────
+        logger.debug("Step 2/2: filename heuristic")
+        heuristic_result = self._filename_heuristic(filename)
+        if heuristic_result:
+            logger.info(
+                f"Step 2 ✓ Heuristic: '{filename}' → "
+                f"{heuristic_result['food_name']} (confidence={heuristic_result['confidence']})"
+            )
+            return heuristic_result
+
+        logger.debug("Step 2: heuristic found no match")
+
+        # All layers failed
         combined_error = " | ".join(errors)
-        print(f"[CalorieService] All AI scans failed. Details: {combined_error}")
+        logger.error(f"All image scan steps failed for '{filename}'. Details: {combined_error}")
         raise ValueError(f"AI image scanning failed: {combined_error}")
 
     # ─────────────────────────────────────────────────────────────────────
     # Private helpers
     # ─────────────────────────────────────────────────────────────────────
 
-    # _call_gemini removed — now handled by GeminiClient in gemini_client.py
-
     def _filename_heuristic(self, filename: str) -> dict | None:
         filename_lower = filename.lower()
-        base_name = filename.rsplit(".", 1)[0] if "." in filename else filename
-        clean_name = re.sub(r"[-_\s]+", " ", base_name).strip()
-        is_generic = bool(
+        base_name      = filename.rsplit(".", 1)[0] if "." in filename else filename
+        clean_name     = re.sub(r"[-_\s]+", " ", base_name).strip()
+        is_generic     = bool(
             re.match(r"^(img|image|photo|screenshot|camera|pic|dsc|uuid|file)\b", clean_name.lower())
             or not clean_name
             or re.match(r"^\d+$", clean_name)
@@ -438,6 +473,7 @@ class CalorieService:
 
         for keyword, base_data in _LOCAL_FOOD_DB.items():
             if keyword in filename_lower:
+                logger.debug(f"Heuristic: filename keyword match '{keyword}'")
                 return {
                     "food_name":  f"Scanned {base_data['food_name']}",
                     "calories":   base_data["calories"],
@@ -447,13 +483,14 @@ class CalorieService:
                     "confidence": 0.85,
                 }
 
-        if not is_generic:
-            return {
-                "food_name":  f"Scanned {clean_name.title()}",
-                "calories":   320,
-                "protein":    12.5,
-                "carbs":      38.0,
-                "fat":        10.5,
-                "confidence": 0.70,
-            }
+        # Do not fabricate nutrition data for non-generic filenames.
+        # If the AI chain failed, return None so scan_image() raises the
+        # "all layers failed" error and the frontend can prompt manual entry.
+        logger.debug(f"Heuristic: no keyword match for '{filename}' — returning None")
         return None
+
+    def _sanitize_description(self, description: str) -> str:
+        text = description.strip()
+        text = text[:500]
+        text = text.replace("{", "").replace("}", "")
+        return text

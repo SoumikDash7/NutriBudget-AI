@@ -95,7 +95,7 @@ class NutritionCalculator:
     ) -> int:
 
         if goal == Goal.LOSE:
-            return int(tdee - 500)
+            return max(int(tdee - 500), 1200)
 
         if goal == Goal.GAIN:
             return int(tdee + 300)

@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.dependencies import get_current_user
 from app.db.session import get_db
 from app.models.user import User
@@ -26,6 +27,10 @@ from app.services.auth.login_service import LoginService
 from app.services.auth.token_service import TokenService
 from app.services.auth.password_service import PasswordService
 from app.services.otp_service import OTPService
+from app.core.rate_limit import InMemoryRateLimiter
+
+
+auth_rate_limiter = InMemoryRateLimiter(requests_limit=5, window_seconds=60)
 
 
 router = APIRouter(
@@ -40,17 +45,24 @@ router = APIRouter(
     status_code=status.HTTP_201_CREATED,
 )
 async def register(
-    request: RegisterRequest,
+    request: Request,
+    body: RegisterRequest,
     db: AsyncSession = Depends(get_db),
 ):
+    client_ip = request.client.host if request.client else "unknown"
+    if not auth_rate_limiter.is_allowed(f"register:{client_ip}"):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many registration attempts. Please try again in a minute.",
+        )
     service = RegisterService(db)
 
     try:
         return await service.register(
-            email=request.email,
-            phone=request.phone,
-            password=request.password,
-            otp_code=request.otp_code,
+            email=body.email,
+            phone=body.phone,
+            password=body.password,
+            otp_code=body.otp_code,
         )
 
     except ValueError as e:
@@ -65,16 +77,23 @@ async def register(
     response_model=LoginResponse,
 )
 async def login(
-    request: LoginRequest,
+    request: Request,
+    body: LoginRequest,
     db: AsyncSession = Depends(get_db),
 ):
+    client_ip = request.client.host if request.client else "unknown"
+    if not auth_rate_limiter.is_allowed(f"login:{client_ip}"):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts. Please try again in a minute.",
+        )
     service = LoginService(db)
 
     try:
         return await service.login(
-            email=request.email,
-            phone=request.phone,
-            password=request.password,
+            email=body.email,
+            phone=body.phone,
+            password=body.password,
         )
 
     except ValueError as e:
@@ -129,18 +148,26 @@ async def change_password(
     response_model=MessageResponse,
 )
 async def send_otp(
-    request: SendOTPRequest,
+    request: Request,
+    body: SendOTPRequest,
     db: AsyncSession = Depends(get_db),
 ):
+    client_ip = request.client.host if request.client else "unknown"
+    if not auth_rate_limiter.is_allowed(f"send-otp:{client_ip}"):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many OTP requests. Please try again in a minute.",
+        )
     service = OTPService(db)
     try:
         otp_code = await service.generate_and_send_otp(
-            email_or_phone=request.email_or_phone,
-            purpose=request.purpose,
+            email_or_phone=body.email_or_phone,
+            purpose=body.purpose,
         )
-        return {
-            "message": f"OTP successfully sent to {request.email_or_phone}. OTP is {otp_code} (in development mode)."
-        }
+        message = f"OTP successfully sent to {body.email_or_phone}."
+        if settings.APP_ENV == "development":
+            message += f" OTP is {otp_code} (in development mode)."
+        return {"message": message}
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -178,15 +205,24 @@ async def verify_otp(
     response_model=MessageResponse,
 )
 async def forgot_password(
-    request: ForgotPasswordRequest,
+    request: Request,
+    body: ForgotPasswordRequest,
     db: AsyncSession = Depends(get_db),
 ):
+    client_ip = request.client.host if request.client else "unknown"
+    if not auth_rate_limiter.is_allowed(f"forgot:{client_ip}"):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many password reset attempts. Please try again in a minute.",
+        )
     service = PasswordService(db)
     try:
         res = await service.forgot_password(
-            email_or_phone=request.email_or_phone
+            email_or_phone=body.email_or_phone
         )
-        res["message"] += f" OTP is {res['otp_code']} (in development mode)."
+        if "otp_code" in res:
+            res["message"] += f" OTP is {res['otp_code']} (in development mode)."
+            del res["otp_code"]
         return res
     except ValueError as e:
         raise HTTPException(

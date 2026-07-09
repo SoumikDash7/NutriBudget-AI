@@ -40,3 +40,9 @@ class OTPRepository:
         await self.db.commit()
         await self.db.refresh(otp)
         return otp
+
+    async def increment_attempt(self, otp: OTP) -> OTP:
+        otp.attempt_count += 1
+        await self.db.commit()
+        await self.db.refresh(otp)
+        return otp

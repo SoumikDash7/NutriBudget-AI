@@ -1,9 +1,12 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from jose import jwt
+import jwt
 
 from app.core.config import settings
+
+# Export JWTError for compatibility with other files importing it from here
+JWTError = jwt.PyJWTError
 
 
 def create_access_token(
@@ -48,7 +51,7 @@ def create_refresh_token(
     )
 
 
-def decode_token(token: str):
+def decode_token(token: str) -> dict[str, Any]:
     return jwt.decode(
         token,
         settings.SECRET_KEY,

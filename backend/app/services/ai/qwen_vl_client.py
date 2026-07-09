@@ -7,19 +7,22 @@ Call order:
   3. Local Ollama endpoint           (qwen2.5vl:7b) when running locally
 """
 
-import base64
-import json
-import re
 import httpx
-
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from app.core.config import settings
+from app.core.logging import get_logger
+from app.schemas.nutrition import FoodInput, NutritionEstimate, ExtractedIngredient
+from app.services.ai.base import NutritionProvider
+from app.services.ai.utils import extract_json, detect_mime
+from app.services.ai.exceptions import ProviderAPIError
 
-# Nutrition extraction prompt — deterministic, JSON-only output
+logger = get_logger(__name__)
+
 _VISION_PROMPT = (
     "You are a professional nutrition analyst. Carefully examine this food image. "
     "Identify ALL visible food items (e.g. rice, curry, bread, drinks). "
     "Estimate the TOTAL combined nutrition for everything on the plate or in the image. "
-    "Return ONLY a valid JSON object with exactly these keys — no markdown, no extra text:\n"
+    "Return ONLY a valid JSON object with exactly these keys -- no markdown, no extra text:\n"
     "{\"food_name\": \"<descriptive combined name>\", "
     "\"calories\": <integer kcal>, "
     "\"protein\": <float grams>, "
@@ -28,79 +31,53 @@ _VISION_PROMPT = (
 )
 
 
-def _detect_mime(filename: str) -> str:
-    fn = filename.lower()
-    if fn.endswith(".png"):
-        return "image/png"
-    if fn.endswith(".webp"):
-        return "image/webp"
-    if fn.endswith(".gif"):
-        return "image/gif"
-    return "image/jpeg"
+class QwenVLClient(NutritionProvider):
+    name = "QwenVL"
+    supports_vision = True
 
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_fixed(1.0),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.RequestError)),
+        reraise=True
+    )
+    async def _post_with_retry(self, http_client: httpx.AsyncClient, url: str, payload: dict, headers: dict | None = None) -> httpx.Response:
+        return await http_client.post(url, json=payload, headers=headers, timeout=30.0)
 
-def _extract_json(text: str) -> dict | None:
-    """Robustly extract the first JSON object from a model response."""
-    try:
-        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
-        if match:
-            return json.loads(match.group(1))
-        return json.loads(text.strip())
-    except Exception:
-        pass
-    try:
-        match = re.search(r"\{.*?\}", text, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-    except Exception:
-        pass
-    return None
+    async def extract(self, food_input: FoodInput, http_client: httpx.AsyncClient) -> NutritionEstimate:
+        base64_img = food_input.image_base64
+        if not base64_img:
+            raise ProviderAPIError("QwenVL vision extractor requires image base64 data.")
 
+        mime_type = detect_mime(food_input.filename or "image.jpg")
+        logger.info("extract image with QwenVLClient")
+        errors = []
 
-class QwenVLClient:
-    """
-    Qwen2.5-VL image understanding client.
-
-    Call order:
-      1. HuggingFace Inference API  (requires HUGGINGFACE_API_KEY)
-      2. Local Ollama endpoint       (requires Ollama running locally)
-    """
-
-    async def scan_image(
-        self,
-        filename: str,
-        file_bytes: bytes,
-    ) -> dict | None:
-        """
-        Returns a dict with keys: food_name, calories, protein, carbs, fat
-        or None if both providers fail.
-        """
-        mime_type = _detect_mime(filename)
-        base64_img = base64.b64encode(file_bytes).decode("utf-8")
-
-        # ── 1. HuggingFace Inference API ──────────────────────────────────
         if settings.HUGGINGFACE_API_KEY:
-            result = await self._call_hf(mime_type, base64_img)
+            try:
+                result = await self._call_hf(mime_type, base64_img, http_client)
+                if result:
+                    return result
+            except Exception as e:
+                errors.append(f"HF Error: {e}")
+                logger.warning(f"HuggingFace providers failed: {e}")
+        else:
+            logger.warning("HUGGINGFACE_API_KEY not set -- skipping HF, going directly to Ollama")
+
+        try:
+            result = await self._call_ollama(mime_type, base64_img, http_client)
             if result:
                 return result
+        except Exception as e:
+            errors.append(f"Ollama Error: {e}")
+            logger.warning(f"Ollama local fallback failed: {e}")
 
-        # ── 2. Local Ollama fallback ───────────────────────────────────────
-        result = await self._call_ollama(mime_type, base64_img)
-        return result
+        raise ProviderAPIError(f"QwenVLClient failed to scan image. Details: {'; '.join(errors)}")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Private helpers
-    # ─────────────────────────────────────────────────────────────────────
-
-    async def _call_hf(self, mime_type: str, base64_img: str) -> dict | None:
-        """
-        HuggingFace router for Qwen2.5-VL-7B-Instruct.
-        Tries 'novita' provider first, then 'nebius' as secondary.
-        Both support multimodal vision — hf-inference does NOT.
-        """
+    async def _call_hf(self, mime_type: str, base64_img: str, http_client: httpx.AsyncClient) -> NutritionEstimate | None:
         providers = [
-            ("novita",  "https://router.huggingface.co/novita/v1/chat/completions"),
-            ("nebius",  "https://router.huggingface.co/nebius/v1/chat/completions"),
+            ("novita", "https://router.huggingface.co/novita/v1/chat/completions"),
+            ("nebius", "https://router.huggingface.co/nebius/v1/chat/completions"),
         ]
         headers = {
             "Authorization": f"Bearer {settings.HUGGINGFACE_API_KEY}",
@@ -108,74 +85,72 @@ class QwenVLClient:
         }
         payload = {
             "model": "Qwen/Qwen2.5-VL-7B-Instruct",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type};base64,{base64_img}"
-                            },
-                        },
-                        {"type": "text", "text": _VISION_PROMPT},
-                    ],
-                }
-            ],
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_img}"}},
+                {"type": "text", "text": _VISION_PROMPT},
+            ]}],
             "max_tokens": 256,
             "temperature": 0.1,
         }
         for provider_name, url in providers:
+            logger.debug(f"HF/{provider_name}: POST -> {url}")
             try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(url, json=payload, headers=headers, timeout=30.0)
-                    if response.status_code == 200:
-                        data = response.json()
-                        text = (
-                            data.get("choices", [{}])[0]
-                            .get("message", {})
-                            .get("content", "")
+                response = await self._post_with_retry(http_client, url, payload, headers)
+                if response.status_code == 200:
+                    data = response.json()
+                    text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    parsed = extract_json(text)
+                    required = {"food_name", "calories", "protein", "carbs", "fat"}
+                    if parsed and required.issubset(parsed.keys()):
+                        logger.info(f"HF/{provider_name}: ok {parsed['food_name']} ({parsed['calories']} kcal)")
+                        return NutritionEstimate(
+                            ingredients=[ExtractedIngredient(name=parsed["food_name"], quantity=1.0, unit="serving")],
+                            calories=float(parsed["calories"]),
+                            protein_g=float(parsed["protein"]),
+                            carbs_g=float(parsed["carbs"]),
+                            fat_g=float(parsed["fat"]),
+                            confidence=0.95,
+                            source_provider=f"QwenVL ({provider_name})"
                         )
-                        parsed = _extract_json(text)
-                        if parsed and "food_name" in parsed and "calories" in parsed:
-                            print(f"[QwenVL/{provider_name}] Identified: {parsed['food_name']} ({parsed['calories']} kcal)")
-                            return parsed
                     else:
-                        print(f"[QwenVL/{provider_name}] HTTP {response.status_code}: {response.text[:200]}")
+                        logger.warning(f"HF/{provider_name}: JSON extraction failed. Raw: '{text[:200]}'")
+                else:
+                    logger.warning(f"HF/{provider_name}: HTTP {response.status_code}")
             except Exception as e:
-                print(f"[QwenVL/{provider_name}] Request failed: {e}")
+                logger.error(f"HF/{provider_name}: request failed -- {e}", exc_info=True)
         return None
 
-    async def _call_ollama(self, mime_type: str, base64_img: str) -> dict | None:
-        """
-        Local Ollama multimodal endpoint — no API key required.
-        Run: ollama pull qwen2.5vl:7b
-        """
+    async def _call_ollama(self, mime_type: str, base64_img: str, http_client: httpx.AsyncClient) -> NutritionEstimate | None:
         url = f"{settings.OLLAMA_BASE_URL}/api/chat"
+        logger.debug(f"Ollama: POST -> {url}  model={settings.OLLAMA_VISION_MODEL}")
         payload = {
             "model": settings.OLLAMA_VISION_MODEL,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": _VISION_PROMPT,
-                    "images": [base64_img],
-                }
-            ],
+            "messages": [{"role": "user", "content": _VISION_PROMPT, "images": [base64_img]}],
             "stream": False,
             "options": {"temperature": 0.1},
         }
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(url, json=payload, timeout=30.0)
-                if response.status_code == 200:
-                    data = response.json()
-                    text = data.get("message", {}).get("content", "")
-                    parsed = _extract_json(text)
-                    if parsed and "food_name" in parsed and "calories" in parsed:
-                        print(f"[QwenVL/Ollama] Identified: {parsed['food_name']} ({parsed['calories']} kcal)")
-                        return parsed
+            response = await self._post_with_retry(http_client, url, payload)
+            if response.status_code == 200:
+                data = response.json()
+                text = data.get("message", {}).get("content", "")
+                parsed = extract_json(text)
+                required = {"food_name", "calories", "protein", "carbs", "fat"}
+                if parsed and required.issubset(parsed.keys()):
+                    logger.info(f"Ollama: ok {parsed['food_name']} ({parsed['calories']} kcal)")
+                    return NutritionEstimate(
+                        ingredients=[ExtractedIngredient(name=parsed["food_name"], quantity=1.0, unit="serving")],
+                        calories=float(parsed["calories"]),
+                        protein_g=float(parsed["protein"]),
+                        carbs_g=float(parsed["carbs"]),
+                        fat_g=float(parsed["fat"]),
+                        confidence=0.95,
+                        source_provider="Ollama (Local QwenVL)"
+                    )
                 else:
-                    print(f"[QwenVL/Ollama] HTTP {response.status_code}: {response.text[:200]}")
+                    logger.warning(f"Ollama: JSON extraction failed. Raw: '{text[:200]}'")
+            else:
+                logger.warning(f"Ollama: HTTP {response.status_code}")
         except Exception as e:
-            print(f"[QwenVL/Ollama] Request failed (is Ollama running?): {e}")
+            logger.error(f"Ollama: request failed -- {e}", exc_info=True)
         return None

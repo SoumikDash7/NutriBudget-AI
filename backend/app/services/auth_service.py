@@ -101,6 +101,8 @@ class AuthService:
             raise ValueError("Invalid refresh token.")
 
         user_id = payload.get("sub")
+        if not user_id:
+            raise ValueError("Invalid refresh token.")
 
         user = await self.repo.get_by_id(user_id)
 
