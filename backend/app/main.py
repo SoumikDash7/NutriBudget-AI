@@ -1,3 +1,16 @@
+# ── Bootstrap logging FIRST — must be before any other app import ─────────
+# Uvicorn configures its own handlers before main.py runs, so we import
+# setup_logging alone first, apply it, then import everything else.
+import logging as _logging
+from app.core.logging import get_logger, setup_logging  # noqa: E402
+from app.core.config import settings  # noqa: E402
+
+setup_logging(
+    level=_logging.DEBUG if settings.APP_ENV == "development" else _logging.INFO,
+    log_file="logs/app.log" if settings.APP_ENV != "development" else None,
+)
+
+# ── Now import the rest of the app ────────────────────────────────────────
 import time
 from contextlib import asynccontextmanager
 
@@ -7,17 +20,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.api.v1.api import api_router
-from app.core.config import settings
 from app.core.handlers import register_exception_handlers
-from app.core.logging import get_logger, setup_logging
 from app.db.session import engine
-
-# ── Bootstrap logging first, before any other import that may log ─────────
-import logging as _logging
-setup_logging(
-    level=_logging.DEBUG if settings.APP_ENV == "development" else _logging.INFO,
-    log_file="logs/app.log" if settings.APP_ENV != "development" else None,
-)
 
 logger = get_logger(__name__)
 
@@ -39,11 +43,11 @@ async def lifespan(app: FastAPI):
     hf_ok         = bool(settings.HUGGINGFACE_API_KEY)
     usda_ok       = bool(settings.USDA_API_KEY)
     logger.info(
-        f"AI keys loaded — "
-        f"OpenRouter: {'✓' if openrouter_ok else '✗'}  "
-        f"Groq: {'✓' if groq_ok else '✗'}  "
-        f"HuggingFace: {'✓' if hf_ok else '✗'}  "
-        f"USDA: {'✓' if usda_ok else '✗'}"
+        f"AI keys loaded - "
+        f"OpenRouter: {'OK' if openrouter_ok else 'MISSING'}  "
+        f"Groq: {'OK' if groq_ok else 'MISSING'}  "
+        f"HuggingFace: {'OK' if hf_ok else 'MISSING'}  "
+        f"USDA: {'OK' if usda_ok else 'MISSING'}"
     )
     yield
     # Shutdown
@@ -83,7 +87,7 @@ async def log_requests(request: Request, call_next):
     method = request.method
     path   = request.url.path
 
-    logger.debug(f"→ {method} {path}")
+    logger.debug(f"> {method} {path}")
 
     response = await call_next(request)
 
@@ -92,13 +96,13 @@ async def log_requests(request: Request, call_next):
 
     # Colour-code by status range
     if status < 300:
-        logger.info(f"← {method} {path}  [{status}]  {elapsed_ms:.1f}ms")
+        logger.info(f"< {method} {path}  [{status}]  {elapsed_ms:.1f}ms")
     elif status < 400:
-        logger.info(f"← {method} {path}  [{status}]  {elapsed_ms:.1f}ms")
+        logger.info(f"< {method} {path}  [{status}]  {elapsed_ms:.1f}ms")
     elif status < 500:
-        logger.warning(f"← {method} {path}  [{status}]  {elapsed_ms:.1f}ms")
+        logger.warning(f"< {method} {path}  [{status}]  {elapsed_ms:.1f}ms")
     else:
-        logger.error(f"← {method} {path}  [{status}]  {elapsed_ms:.1f}ms")
+        logger.error(f"< {method} {path}  [{status}]  {elapsed_ms:.1f}ms")
 
     return response
 
@@ -111,7 +115,7 @@ async def log_requests(request: Request, call_next):
 @app.get("/", tags=["Root"])
 async def root():
     return {
-        "message": "NutriBudget AI Backend Running 🚀",
+        "message": "NutriBudget AI Backend Running [*]",
         "version": settings.APP_VERSION,
     }
 

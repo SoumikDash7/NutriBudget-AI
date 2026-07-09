@@ -1,5 +1,5 @@
 """
-NutriBudget AI — Centralized Logging Configuration
+NutriBudget AI - Centralized Logging Configuration
 
 Usage in any module:
     from app.core.logging import get_logger
@@ -9,13 +9,13 @@ Usage in any module:
     logger.info("Success")
     logger.warning("Degraded mode, using fallback")
     logger.error("Operation failed", exc_info=True)
-    logger.critical("Fatal — application cannot continue")
+    logger.critical("Fatal - application cannot continue")
 
 Visual Format (console):
-    20:36:01.234  DEBUG    ai.qwen3_client        | HF/featherless-ai: POST → https://router.huggingface.co/...
-    20:36:02.105  INFO     services.ai.orchestr.  | ✓ Provider 'Qwen3' succeeded in 1842.3ms for '2 rotis'
+    20:36:01.234  DEBUG    ai.qwen3_client        | HF/featherless-ai: POST > https://router.huggingface.co/...
+    20:36:02.105  INFO     services.ai.orchestr.  | OK Provider 'Qwen3' succeeded in 1842.3ms for '2 rotis'
     20:36:03.001  WARNING  services.ai.orchestr.  | Provider 'Qwen3' failed after 15001.0ms: HTTP 503
-    20:36:04.880  ERROR    services.ai.qwen_vl    | HF/novita: request failed — ConnectionError
+    20:36:04.880  ERROR    services.ai.qwen_vl    | HF/novita: request failed - ConnectionError
 """
 
 import logging
@@ -40,13 +40,13 @@ _RED      = "\033[31m"
 _MAGENTA  = "\033[35m"
 _BLUE     = "\033[34m"
 
-# Level → colour + emoji prefix mapping
+# Level → colour + symbol prefix mapping (ASCII-safe for Windows cp1252 terminals)
 _LEVEL_STYLES: dict[int, tuple[str, str]] = {
-    logging.DEBUG:    (_DIM + _WHITE,   "·"),
-    logging.INFO:     (_CYAN,           "ℹ"),
-    logging.WARNING:  (_YELLOW,         "⚡"),
-    logging.ERROR:    (_RED,            "✗"),
-    logging.CRITICAL: (_BOLD + _MAGENTA,"‼"),
+    logging.DEBUG:    (_DIM + _WHITE,    "·"),
+    logging.INFO:     (_CYAN,            ">"),
+    logging.WARNING:  (_YELLOW,          "!"),
+    logging.ERROR:    (_RED,             "X"),
+    logging.CRITICAL: (_BOLD + _MAGENTA, "!!"),
 }
 
 # Module-name colour (dim blue to visually separate from message)
@@ -121,6 +121,10 @@ def setup_logging(
     """
     Configure the root logger for the entire application.
 
+    Works alongside uvicorn's logging - does NOT wipe uvicorn's handlers.
+    Instead it installs our ColourFormatter handler once (idempotent) and
+    then ensures all app.* loggers propagate up to root.
+
     Args:
         level:    Minimum log level (default DEBUG in dev, INFO in prod).
         log_file: Optional path to write plain-text logs alongside console.
@@ -128,27 +132,50 @@ def setup_logging(
     root = logging.getLogger()
     root.setLevel(level)
 
-    # Remove any existing handlers (e.g. from basicConfig)
-    root.handlers.clear()
-
-    # ── Console handler (coloured) ────────────────────────────────────────
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(level)
-    console.setFormatter(_ColourFormatter())
-    root.addHandler(console)
+    # ── Console handler ────────────────────────────────────────────────────
+    # Only add if we haven't already (idempotent — safe across --reload cycles)
+    already_installed = any(
+        isinstance(h, logging.StreamHandler)
+        and isinstance(h.formatter, _ColourFormatter)
+        for h in root.handlers
+    )
+    if not already_installed:
+        # On Windows the terminal may use cp1252 — try to switch stderr to UTF-8,
+        # fall back to errors='replace' so Unicode never silently kills a log line.
+        stream = sys.stderr
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        console = logging.StreamHandler(stream)
+        console.setLevel(level)
+        console.setFormatter(_ColourFormatter())
+        root.addHandler(console)
 
     # ── File handler (plain, optional) ────────────────────────────────────
-    if log_file:
+    file_already = any(isinstance(h, logging.FileHandler) for h in root.handlers)
+    if log_file and not file_already:
+        import os
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
         fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.setLevel(level)
         fh.setFormatter(_PlainFormatter())
         root.addHandler(fh)
 
-    # Silence noisy third-party loggers
+    # ── Ensure all app.* loggers propagate to root ────────────────────────
+    # (they should by default, but explicit is safer)
+    logging.getLogger("app").setLevel(level)
+    logging.getLogger("app").propagate = True
+
+    # ── Silence noisy third-party loggers ────────────────────────────────
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # Keep uvicorn.access quiet (it has its own formatted output)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    # But let uvicorn.error through so startup/shutdown messages still appear
+    logging.getLogger("uvicorn.error").setLevel(logging.INFO)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
