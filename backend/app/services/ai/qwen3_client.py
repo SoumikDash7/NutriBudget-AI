@@ -10,40 +10,12 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.schemas.nutrition import FoodInput, NutritionEstimate, ExtractedIngredient
 from app.services.ai.base import NutritionProvider
-from app.services.ai.utils import extract_json
+from app.services.ai.utils import extract_json, build_text_prompt, parse_nutrition_response
 from app.services.ai.exceptions import ProviderAPIError, ParsingError
 
 logger = get_logger(__name__)
 
-_PARSE_PROMPT_TEMPLATE = """
-Analyze this meal description:
-
-{description}
-
-You are a nutrition API.
-
-Your task is to estimate the total nutrition.
-
-Rules:
-
-- Return ONLY valid JSON.
-- No markdown.
-- No explanations.
-- No reasoning.
-- No <think> tags.
-- No code blocks.
-- No extra text.
-
-JSON schema:
-
-{{
-    "food_name": "string",
-    "calories": integer,
-    "protein": float,
-    "carbs": float,
-    "fat": float
-}}
-"""
+_DEFAULT_CONFIDENCE = 0.96
 
 
 class Qwen3Client(NutritionProvider):
@@ -81,7 +53,7 @@ class Qwen3Client(NutritionProvider):
             "Authorization": f"Bearer {settings.HUGGINGFACE_API_KEY}",
             "Content-Type": "application/json",
         }
-        prompt  = _PARSE_PROMPT_TEMPLATE.format(description=description)
+        prompt = build_text_prompt(description)
         payload = {
             "model": model,
             "messages": [
@@ -89,20 +61,32 @@ class Qwen3Client(NutritionProvider):
                     "role": "system",
                     "content": (
                         "You are a nutrition API. "
-                        "Return ONLY valid JSON. "
+                        "Return ONLY valid JSON matching the requested schema. "
                         "No markdown. "
                         "No explanations. "
                         "No <think>. "
+                        "No reasoning of any kind - respond with the final JSON directly. "
                         "No code fences."
                     ),
                 },
                 {
+                    # "/no_think" is a documented Qwen3 chat-template hint that suppresses
+                    # its internal reasoning trace even on routers that don't support the
+                    # chat_template_kwargs field below. Harmless no-op on non-Qwen3 models.
                     "role": "user",
-                    "content": prompt,
+                    "content": prompt + "\n\n/no_think",
                 },
             ],
             "temperature": 0.1,
-            "max_tokens": 256,
+            # Raised from 768: the structured ingredients+total schema needs more output
+            # tokens than the old flat schema, and Qwen3's reasoning trace (if the router
+            # doesn't honor enable_thinking=False) can consume a large chunk of the budget
+            # before it ever reaches the JSON - leaving too little room caused truncated,
+            # unparseable output.
+            "max_tokens": 2048,
+            # Standard vLLM/HF-router field for disabling Qwen3's thinking mode.
+            # Ignored harmlessly by routers/models that don't recognize it.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
         # Try providers in order of verification
@@ -128,35 +112,80 @@ class Qwen3Client(NutritionProvider):
 
                     message = choices[0].get("message", {})
                     text = message.get("content")
-                    if text is None:
-                        logger.warning(f"HF/{provider_name}: Empty content returned.")
-                        continue
+                    reasoning = message.get("reasoning_content")
+                    finish_reason = choices[0].get("finish_reason")
 
-                    parsed = extract_json(text)
-                    required = {"food_name", "calories", "protein", "carbs", "fat"}
+                    if not text:
+                        if reasoning:
+                            # Some reasoning-model routers put the model's thinking (and
+                            # sometimes the whole answer) into a separate reasoning_content
+                            # field instead of content. Fall back to it rather than treating
+                            # this as a hard failure.
+                            logger.warning(
+                                f"HF/{provider_name}: content field empty but "
+                                f"reasoning_content present (finish_reason={finish_reason}) - "
+                                f"model likely returned its answer on a separate reasoning "
+                                f"channel. Attempting to extract JSON from reasoning_content."
+                            )
+                            text = reasoning
+                        else:
+                            logger.warning(
+                                f"HF/{provider_name}: Empty content returned "
+                                f"(finish_reason={finish_reason})."
+                            )
+                            continue
 
-                    if parsed and required.issubset(parsed.keys()):
-                        logger.info(f"OK HF/{provider_name} Parsed: {parsed['food_name']} ({parsed['calories']} kcal)")
-                        
+                    if finish_reason == "length":
+                        logger.warning(
+                            f"HF/{provider_name}: response was truncated by max_tokens "
+                            f"(finish_reason=length) - the model may not have finished "
+                            f"writing its JSON. Consider raising max_tokens further."
+                        )
+
+                    # ---------------- DEBUG ----------------#
+                    logger.debug("=" * 80)
+                    logger.debug("HF/%s RAW MODEL OUTPUT:", provider_name)
+                    logger.debug("%s", text)
+                    logger.debug("=" * 80)
+                    # ---------------------------------------#
+
+                    raw_parsed = extract_json(text)
+                    logger.info("RAW MODEL OUTPUT:\n%s", text)
+                    logger.debug("Extracted JSON:\n%s", raw_parsed)
+
+                    normalized = parse_nutrition_response(raw_parsed)
+
+                    if normalized:
+                        ingredient_names = ", ".join(i["name"] for i in normalized["ingredients"])
+                        logger.info(
+                            f"OK HF/{provider_name} Parsed: [{ingredient_names}] "
+                            f"({normalized['calories']} kcal total)"
+                        )
+
+                        confidence = normalized["confidence"] if normalized["confidence"] is not None else _DEFAULT_CONFIDENCE
+
                         return NutritionEstimate(
                             ingredients=[
                                 ExtractedIngredient(
-                                    name=parsed["food_name"],
-                                    quantity=1.0,
-                                    unit="serving"
+                                    name=ing["name"],
+                                    quantity=ing["quantity"],
+                                    unit=ing["unit"],
                                 )
+                                for ing in normalized["ingredients"]
                             ],
-                            calories=float(parsed["calories"]),
-                            protein_g=float(parsed["protein"]),
-                            carbs_g=float(parsed["carbs"]),
-                            fat_g=float(parsed["fat"]),
-                            confidence=0.96,
+                            calories=normalized["calories"],
+                            protein_g=normalized["protein"],
+                            carbs_g=normalized["carbs"],
+                            fat_g=normalized["fat"],
+                            confidence=confidence,
                             source_provider=f"Qwen3 ({provider_name})"
                         )
                     else:
                         logger.warning(
-                            "HF/%s returned invalid JSON Schema or format.",
+                            "HF/%s invalid/unusable schema (finish_reason=%s).\nExtracted=%s",
                             provider_name,
+                            finish_reason,
+                            raw_parsed,
                         )
                 else:
                     logger.warning(f"HF/{provider_name}: HTTP {http_status} - {response.text[:200]}")

@@ -95,7 +95,9 @@ class TestQwen3Client:
         assert isinstance(result, NutritionEstimate)
         assert result.calories == 650.0
         assert result.protein_g == 38.0
-        assert result.source_provider.startswith("Qwen3")
+        provider = result.source_provider
+        assert provider is not None
+        assert provider.startswith("Qwen3")
 
     @pytest.mark.asyncio
     @patch("app.services.ai.qwen3_client.settings")
@@ -570,7 +572,9 @@ class TestQwenVLClient:
 
         assert isinstance(result, NutritionEstimate)
         assert result.calories == 650.0
-        assert "QwenVL" in result.source_provider
+        provider = result.source_provider
+        assert provider is not None
+        assert "QwenVL" in provider
 
     @pytest.mark.asyncio
     @patch("app.services.ai.qwen_vl_client.settings")

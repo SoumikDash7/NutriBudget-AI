@@ -13,35 +13,20 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.schemas.nutrition import FoodInput, NutritionEstimate, ExtractedIngredient
 from app.services.ai.base import NutritionProvider
-from app.services.ai.utils import extract_json, detect_mime
+from app.services.ai.utils import (
+    extract_json,
+    detect_mime,
+    build_text_prompt,
+    build_vision_prompt,
+    parse_nutrition_response,
+)
 from app.services.ai.exceptions import ProviderAPIError
 
 logger = get_logger(__name__)
 
 _BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
-_SYSTEM_PROMPT = "Return ONLY valid JSON. No markdown. No explanations. No reasoning blocks."
-
-_USER_PROMPT_TEMPLATE = (
-    "You are a professional nutrition analyst. Analyze this meal description: '{description}'. "
-    "Estimate the TOTAL combined nutrition. Return ONLY a valid JSON object with "
-    "exactly these keys - no markdown, no extra text:\n"
-    '{{"food_name": "<descriptive combined name>", '
-    '"calories": <integer kcal>, '
-    '"protein": <float grams>, '
-    '"carbs": <float grams>, '
-    '"fat": <float grams>}}'
-)
-
-_VISION_PROMPT_TEMPLATE = (
-    "You are a professional nutrition analyst. {context_instruction} "
-    "Estimate the TOTAL combined nutrition. Return ONLY a valid JSON object with "
-    "exactly these keys - no markdown, no extra text:\n"
-    '{{"food_name": "<descriptive combined name>", '
-    '"calories": <integer kcal>, '
-    '"protein": <float grams>, '
-    '"carbs": <float grams>, '
-    '"fat": <float grams>}}'
-)
+_SYSTEM_PROMPT = "Return ONLY valid JSON matching the requested schema. No markdown. No explanations. No reasoning blocks."
+_DEFAULT_CONFIDENCE = 0.80
 
 
 class GroqLlamaClient(NutritionProvider):
@@ -65,16 +50,15 @@ class GroqLlamaClient(NutritionProvider):
         if food_input.image_base64:
             model = settings.GROQ_LLAMA_VISION_MODEL
             mime_type = detect_mime(food_input.filename or "image.jpg")
-            context_instruction = "Carefully examine this food image and identify ALL visible food items."
             content = [
-                {"type": "text", "text": _VISION_PROMPT_TEMPLATE.format(context_instruction=context_instruction)},
+                {"type": "text", "text": build_vision_prompt()},
                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{food_input.image_base64}"}},
             ]
             messages = [{"role": "user", "content": content}]
         elif food_input.text:
             messages = [
                 {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": _USER_PROMPT_TEMPLATE.format(description=food_input.text)},
+                {"role": "user", "content": build_text_prompt(food_input.text)},
             ]
         else:
             raise ProviderAPIError("GroqLlamaClient requires either image_base64 or text in FoodInput.")
@@ -83,7 +67,7 @@ class GroqLlamaClient(NutritionProvider):
             "model": model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": 256,
+            "max_tokens": 768,
         }
         headers = {
             "Authorization": f"Bearer {settings.GROQ_API_KEY}",
@@ -110,21 +94,41 @@ class GroqLlamaClient(NutritionProvider):
             raise ProviderAPIError("Groq returned empty choices list.")
 
         raw_text = choices[0].get("message", {}).get("content", "")
-        parsed = extract_json(raw_text)
 
-        required = {"food_name", "calories", "protein", "carbs", "fat"}
-        if not parsed or not required.issubset(parsed.keys()):
+        logger.debug("=" * 80)
+        logger.debug("Groq RAW MODEL OUTPUT:")
+        logger.debug("%s", raw_text)
+        logger.debug("=" * 80)
+
+        raw_parsed = extract_json(raw_text)
+        normalized = parse_nutrition_response(raw_parsed)
+
+        if not normalized:
             raise ProviderAPIError(
                 f"Groq returned unparseable/incomplete JSON. Raw: '{raw_text[:200]}'"
             )
 
-        logger.info(f"Groq Llama: OK {parsed['food_name']} ({parsed['calories']} kcal)")
+        if len(normalized["ingredients"]) == 1:
+            logger.warning(
+                f"Groq returned only a single ingredient for '{food_input.text or 'image input'}' "
+                f"- it may have ignored the structured-schema instructions and collapsed "
+                f"everything into one combined name. Raw: '{raw_text[:300]}'"
+            )
+
+        ingredient_names = ", ".join(i["name"] for i in normalized["ingredients"])
+        logger.info(f"Groq Llama: OK [{ingredient_names}] ({normalized['calories']} kcal total)")
+
+        confidence = normalized["confidence"] if normalized["confidence"] is not None else _DEFAULT_CONFIDENCE
+
         return NutritionEstimate(
-            ingredients=[ExtractedIngredient(name=parsed["food_name"], quantity=1.0, unit="serving")],
-            calories=float(parsed["calories"]),
-            protein_g=float(parsed["protein"]),
-            carbs_g=float(parsed["carbs"]),
-            fat_g=float(parsed["fat"]),
-            confidence=0.80,
+            ingredients=[
+                ExtractedIngredient(name=ing["name"], quantity=ing["quantity"], unit=ing["unit"])
+                for ing in normalized["ingredients"]
+            ],
+            calories=normalized["calories"],
+            protein_g=normalized["protein"],
+            carbs_g=normalized["carbs"],
+            fat_g=normalized["fat"],
+            confidence=confidence,
             source_provider="Groq Llama",
         )

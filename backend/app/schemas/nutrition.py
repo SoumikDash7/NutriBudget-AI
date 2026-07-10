@@ -24,8 +24,10 @@ class FoodInput(BaseModel):
 
 class ExtractedIngredient(BaseModel):
     name: str
-    quantity: float
-    unit: str
+    # Defaults let callers build a minimal ingredient (e.g. a fallback flat
+    # "food_name" with no explicit amount) without needing to invent values.
+    quantity: float = 1.0
+    unit: str = "serving"
 
 
 class NutritionEstimate(BaseModel):
@@ -36,6 +38,13 @@ class NutritionEstimate(BaseModel):
     fat_g: float
     confidence: float = Field(ge=0.0, le=1.0)
     source_provider: Optional[str] = None
+
+    @field_validator("ingredients")
+    @classmethod
+    def ingredients_not_empty(cls, v):
+        if not v:
+            raise ValueError("ingredients list cannot be empty")
+        return v
 
     @field_validator("calories")
     @classmethod

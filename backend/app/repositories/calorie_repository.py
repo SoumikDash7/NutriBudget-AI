@@ -1,6 +1,7 @@
 from datetime import date, timedelta
 from uuid import UUID
-from sqlalchemy import select, and_, delete
+from typing import cast
+from sqlalchemy import select, and_, delete, CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.calorie import CalorieLog
@@ -54,4 +55,4 @@ class CalorieRepository:
             )
         )
         await self.db.commit()
-        return result.rowcount
+        return cast(CursorResult, result).rowcount or 0

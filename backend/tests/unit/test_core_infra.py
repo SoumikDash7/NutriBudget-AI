@@ -77,6 +77,7 @@ class TestInMemoryTTLCache:
         cache = self._make_cache()
         cache.set("roti_estimate", estimate)
         result = cache.get("roti_estimate")
+        assert result is not None
         assert result is estimate  # same object reference
         assert result.calories == 200.0
 
@@ -93,8 +94,12 @@ class TestInMemoryTTLCache:
         cache = self._make_cache()
         cache.set("apple", {"calories": 95})
         cache.set("banana", {"calories": 105})
-        assert cache.get("apple")["calories"] == 95
-        assert cache.get("banana")["calories"] == 105
+        apple_data = cache.get("apple")
+        banana_data = cache.get("banana")
+        assert apple_data is not None
+        assert banana_data is not None
+        assert apple_data["calories"] == 95
+        assert banana_data["calories"] == 105
 
     def test_none_value_can_be_stored(self):
         """Explicit None values should still be stored and returned."""

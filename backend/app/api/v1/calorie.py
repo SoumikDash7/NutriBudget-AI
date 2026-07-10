@@ -174,7 +174,8 @@ async def scan_food_image(
 
     service = CalorieService(db, http_client=http_client)
     try:
-        return await service.scan_image(file.filename, file_bytes)
+        filename = file.filename or "image.jpg"
+        return await service.scan_image(filename, file_bytes)
     except ValueError as e:
         err_msg = str(e)
         if "401" in err_msg or "unauthenticated" in err_msg.lower() or "credentials" in err_msg.lower():

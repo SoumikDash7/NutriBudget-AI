@@ -58,7 +58,7 @@ class BudgetService:
         # Handle collaboration notifications
         if collab:
                 creator = await self.user_repo.get_by_id(user_id)
-                creator_name = creator.email or creator.phone or "Someone"
+                creator_name = (creator.email or creator.phone or "Someone") if creator else "Someone"
 
                 # Identify the other person to notify
                 recipient_id = collab.partner_id if user_id == collab.owner_id else collab.owner_id
@@ -134,7 +134,7 @@ class BudgetService:
 
         # Notify the partner
         owner = await self.user_repo.get_by_id(owner_id)
-        owner_name = owner.email or owner.phone or "Someone"
+        owner_name = (owner.email or owner.phone or "Someone") if owner else "Someone"
 
         invite_message = f"{owner_name} invited you to collaborate on the shared budget '{name}'."
         notif = BudgetNotification(
@@ -172,7 +172,7 @@ class BudgetService:
 
         # Notify the owner
         partner = await self.user_repo.get_by_id(partner_id)
-        partner_name = partner.email or partner.phone or "Someone"
+        partner_name = (partner.email or partner.phone or "Someone") if partner else "Someone"
 
         notification_message = f"{partner_name} {status} your invitation to collaborate on '{collab.name}'."
         notif = BudgetNotification(

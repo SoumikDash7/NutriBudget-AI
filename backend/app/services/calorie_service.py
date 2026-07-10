@@ -18,6 +18,7 @@ Text parse call order:
 
 import re
 import base64
+import difflib
 import httpx
 from datetime import date, timedelta
 from uuid import UUID
@@ -214,6 +215,19 @@ def _build_orchestrator() -> AIOrchestrator:
     return _orchestrator_cache
 
 
+# Units that indicate the leading number is a WEIGHT/VOLUME amount, not a
+# serving-count multiplier (e.g. "250 g chicken" vs "2 rotis").
+# A number followed by one of these should never be used to multiply
+# nutrition totals - the amount is already baked into the description that
+# gets sent to the AI (and, for the Local DB fallback, into the per-keyword
+# reference value's own label, e.g. "Chicken Breast (100g)").
+_WEIGHT_UNIT_PATTERN = re.compile(
+    r"^(g|gm|gms|gram|grams|kg|kgs|kilogram|kilograms|"
+    r"ml|mls|millilitre|millilitres|milliliter|milliliters|"
+    r"l|litre|litres|liter|liters|oz|ounce|ounces|lb|lbs|pound|pounds)\b"
+)
+
+
 class CalorieService:
 
     def __init__(self, db: AsyncSession, http_client: httpx.AsyncClient | None = None):
@@ -313,19 +327,38 @@ class CalorieService:
           1. AIOrchestrator text chain (Qwen3 -> Gemma -> Groq -> USDA)
           2. Local DB (Indian + international) - offline database lookup fallback
           3. Open Food Facts search - product lookup fallback
+
+        IMPORTANT: any leading number in the description (e.g. "2 rotis") is
+        parsed ONLY as a serving-count hint for the Local DB fallback (Step 2),
+        where reference values are stored per single unit. It is deliberately
+        NOT applied to the AI orchestrator result (Step 1): the orchestrator
+        receives the full original description and already returns TOTAL
+        nutrition for whatever quantity/weight was described - e.g.
+        "250 g chicken with 20 g butter" comes back as the total for that
+        250g + 20g, not a per-unit figure that needs multiplying again.
+        Multiplying it again by 250 would be the exact quantity-multiplication
+        bug this pipeline is designed to avoid.
         """
         logger.info(f"parse_description: '{description}'")
         desc_lower = description.lower().strip()
 
-        # Parse optional leading quantity e.g. "2 rotis"
+        # Leading integer, used ONLY by the Local DB fallback (Step 2) below.
         quantity  = 1
         num_match = re.match(r"^(\d+)\s+(.+)$", desc_lower)
-        if num_match:
+        if num_match and not _WEIGHT_UNIT_PATTERN.match(num_match.group(2)):
             quantity   = int(num_match.group(1))
             food_query = num_match.group(2)
-            logger.debug(f"Quantity detected: {quantity}x '{food_query}'")
+            logger.debug(
+                f"Leading serving-count detected: {quantity}x '{food_query}' "
+                f"(Local DB fallback only - not applied to AI result)"
+            )
         else:
             food_query = desc_lower
+            if num_match:
+                logger.debug(
+                    "Leading number looks like a weight/volume amount, not a "
+                    "serving count - ignoring as multiplier"
+                )
 
         # ── 1. Orchestrated AI Pipeline (Qwen3 -> Gemma -> Groq -> USDA) ──
         logger.debug("Step 1/3: AIOrchestrator text parse")
@@ -338,21 +371,41 @@ class CalorieService:
         try:
             result = await self.orchestrator.parse_text(sanitized_description, self.http_client)
             if result:
-                name = result.ingredients[0].name if result.ingredients else "Unknown Food"
-                # Apply quantity scaling if detected
-                if quantity > 1:
-                    scaled_name = f"{quantity}x {name}"
+                # Surface every parsed ingredient, not just the first one - a combined
+                # description like "500g chicken with butter, roti, and lime soda" should
+                # produce a food_name that reflects all items, and the raw per-ingredient
+                # breakdown should still be available to the caller (e.g. for display or
+                # editing), rather than being silently dropped after the first entry.
+                if result.ingredients:
+                    if len(result.ingredients) == 1:
+                        name = result.ingredients[0].name
+                    else:
+                        name = ", ".join(ing.name for ing in result.ingredients)
                 else:
-                    scaled_name = name
+                    name = "Unknown Food"
 
-                return {
-                    "food_name": scaled_name,
-                    "calories": int(result.calories * quantity),
-                    "protein": round(float(result.protein_g * quantity), 1),
-                    "carbs": round(float(result.carbs_g * quantity), 1),
-                    "fat": round(float(result.fat_g * quantity), 1),
-                    "confidence": float(result.confidence),
-                }
+                validated = self._validate_nutrition(
+                    calories=result.calories,
+                    protein=result.protein_g,
+                    carbs=result.carbs_g,
+                    fat=result.fat_g,
+                    source="AIOrchestrator",
+                )
+                if validated is not None:
+                    logger.info(f"Step 1 OK AIOrchestrator: {name} ({validated['calories']} kcal)")
+                    return {
+                        "food_name": name,
+                        "calories": validated["calories"],
+                        "protein": validated["protein"],
+                        "carbs": validated["carbs"],
+                        "fat": validated["fat"],
+                        "confidence": result.confidence,
+                        "ingredients": [
+                            {"name": ing.name, "quantity": ing.quantity, "unit": ing.unit}
+                            for ing in result.ingredients
+                        ],
+                    }
+                logger.warning("Step 1: AIOrchestrator result failed nutrition validation - falling back")
         except Exception as e:
             logger.warning(f"AIOrchestrator text parse failed: {e}")
 
@@ -377,10 +430,13 @@ class CalorieService:
         logger.debug("Step 3/3: Open Food Facts product search")
         try:
             off_results = await self.off_client.search_products(description)
-            if off_results:
-                top = off_results[0]
+            relevant = self._filter_relevant_off_results(description, off_results)
+            if relevant:
+                top = relevant[0]
                 logger.info(f"Step 3 OK OpenFoodFacts: {top['food_name']} ({top['calories']} kcal)")
                 return {**top, "confidence": 0.80}
+            elif off_results:
+                logger.debug("Step 3: Open Food Facts returned results but none passed relevance threshold")
             else:
                 logger.debug("Step 3: Open Food Facts returned no usable results")
         except Exception as e:
@@ -425,16 +481,36 @@ class CalorieService:
         try:
             result = await self.orchestrator.parse_image(base64_img, self.http_client, filename=filename)
             if result:
-                name = result.ingredients[0].name if result.ingredients else "Scanned Food"
-                logger.info(f"Step 1 OK Orchestrator Vision: {name} ({result.calories} kcal)")
-                return {
-                    "food_name": name,
-                    "calories": int(result.calories),
-                    "protein": float(result.protein_g),
-                    "carbs": float(result.carbs_g),
-                    "fat": float(result.fat_g),
-                    "confidence": float(result.confidence),
-                }
+                if result.ingredients:
+                    if len(result.ingredients) == 1:
+                        name = result.ingredients[0].name
+                    else:
+                        name = ", ".join(ing.name for ing in result.ingredients)
+                else:
+                    name = "Scanned Food"
+
+                validated = self._validate_nutrition(
+                    calories=result.calories,
+                    protein=result.protein_g,
+                    carbs=result.carbs_g,
+                    fat=result.fat_g,
+                    source="AIOrchestrator Vision",
+                )
+                if validated is not None:
+                    logger.info(f"Step 1 OK Orchestrator Vision: {name} ({validated['calories']} kcal)")
+                    return {
+                        "food_name": name,
+                        "calories": validated["calories"],
+                        "protein": validated["protein"],
+                        "carbs": validated["carbs"],
+                        "fat": validated["fat"],
+                        "confidence": result.confidence,
+                        "ingredients": [
+                            {"name": ing.name, "quantity": ing.quantity, "unit": ing.unit}
+                            for ing in result.ingredients
+                        ],
+                    }
+                logger.warning("Step 1: Vision result failed nutrition validation - falling back")
         except Exception as e:
             err_msg = f"AIOrchestrator Vision failed: {e}"
             logger.warning(f"Step 1 FAIL {err_msg}")
@@ -494,3 +570,69 @@ class CalorieService:
         text = text[:500]
         text = text.replace("{", "").replace("}", "")
         return text
+
+    def _validate_nutrition(
+        self, calories: float, protein: float, carbs: float, fat: float, source: str
+    ) -> dict | None:
+        """
+        Reject physically impossible AI output before it's accepted.
+
+        This is a lightweight guard, not a full validation layer - it only
+        catches the clearly-impossible cases (Priority 14): negative values,
+        or macro grams that couldn't possibly fit given 4/4/9 kcal-per-gram
+        math (allowing generous headroom for rounding/estimation error).
+        """
+        if calories is None or calories < 0:
+            logger.warning(f"{source}: rejected - negative/missing calories ({calories})")
+            return None
+        if protein is None or protein < 0 or carbs is None or carbs < 0 or fat is None or fat < 0:
+            logger.warning(f"{source}: rejected - negative macro value (p={protein}, c={carbs}, f={fat})")
+            return None
+
+        # Macro-implied calories should roughly match the stated total.
+        # Allow generous slack (2x) since AI estimates fiber/alcohol/rounding
+        # differently - this is a sanity check, not a strict recompute.
+        implied_calories = protein * 4 + carbs * 4 + fat * 9
+        if implied_calories > 0 and calories > 0:
+            ratio = implied_calories / calories
+            if ratio > 3.0 or ratio < 0.2:
+                logger.warning(
+                    f"{source}: rejected - macros imply {implied_calories:.0f} kcal "
+                    f"vs stated {calories:.0f} kcal (ratio={ratio:.2f})"
+                )
+                return None
+
+        return {
+            "calories": int(calories),
+            "protein": round(protein, 1),
+            "carbs": round(carbs, 1),
+            "fat": round(fat, 1),
+        }
+
+    def _filter_relevant_off_results(self, query: str, results: list[dict]) -> list[dict]:
+        """
+        Open Food Facts free-text search often returns loosely-related
+        products. Filter out results whose product name has low textual
+        similarity to the query (Priority 10) rather than trusting the
+        first hit unconditionally.
+        """
+        query_norm = query.strip().lower()
+        relevant = []
+        for r in results:
+            name_norm = r.get("food_name", "").strip().lower()
+            if not name_norm:
+                continue
+            similarity = difflib.SequenceMatcher(None, query_norm, name_norm).ratio()
+            # Also credit direct word overlap, since OFF names are often
+            # branded/verbose (e.g. "Kellogg's Corn Flakes Original 500g")
+            # and won't score high on raw sequence similarity alone.
+            query_words  = set(query_norm.split())
+            name_words   = set(name_norm.split())
+            word_overlap = len(query_words & name_words) / max(len(query_words), 1)
+
+            score = max(similarity, word_overlap)
+            if score >= 0.35:
+                relevant.append(r)
+            else:
+                logger.debug(f"OFF result filtered out (score={score:.2f}): '{r.get('food_name')}'")
+        return relevant
