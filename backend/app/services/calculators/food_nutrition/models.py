@@ -123,7 +123,7 @@ class NutritionFacts:
 
     sodium: float
 
-    serving_unit: str = "100g"
+    serving_unit: str = "g"
 
     def __post_init__(self) -> None:
         self.food_name = self.food_name.strip()
@@ -160,6 +160,8 @@ class NutritionResult:
 
     ingredients: list[Ingredient] = field(default_factory=list)
 
+    scaled_items: list["ScaledNutrition"] = field(default_factory=list)
+
     total_calories: float = 0.0
 
     total_protein: float = 0.0
@@ -192,80 +194,40 @@ class NutritionResult:
                 )
 
 @dataclass(slots=True)
-class FoodItem:
+class ScaledNutrition:
     """
-    Represents a standardized food item with its nutritional profile.
-
-    Attributes:
-        name:
-            Canonical name of the food (e.g., "Chicken Breast, Raw").
-
-        calories:
-            Energy in kcal per serving.
-
-        protein:
-            Protein in grams per serving.
-
-        carbohydrates:
-            Carbohydrates in grams per serving.
-
-        fat:
-            Fat in grams per serving.
-
-        fiber:
-            Dietary fiber in grams per serving.
-
-        sugar:
-            Sugars in grams per serving.
-
-        sodium:
-            Sodium in milligrams per serving.
-
-        serving_size:
-            The amount for which the nutritional values are provided.
-
-        serving_unit:
-            The unit of the serving size (e.g., "g", "ml", "cup", "piece").
-
-        source:
-            The database or source of this information.
-
-        confidence:
-            A measure of how confident we are in this match (0.0 to 1.0).
+    Nutrition for an ingredient after quantity scaling.
     """
 
-    name: str
+    ingredient: Ingredient
+
+    nutrition: NutritionFacts
+
     calories: float
+
     protein: float
+
     carbohydrates: float
+
     fat: float
+
     fiber: float
+
     sugar: float
+
     sodium: float
-    serving_size: float
-    serving_unit: str
-    source: str
-    confidence: float = 1.0
 
     def __post_init__(self) -> None:
-        self.name = self.name.strip()
-        self.serving_unit = self.serving_unit.strip()
-        self.source = self.source.strip()
+        values = {
+            "calories": self.calories,
+            "protein": self.protein,
+            "carbohydrates": self.carbohydrates,
+            "fat": self.fat,
+            "fiber": self.fiber,
+            "sugar": self.sugar,
+            "sodium": self.sodium,
+        }
 
-        if not self.name:
-            raise ValueError("Food item name cannot be empty.")
-
-        if self.calories < 0 or self.protein < 0 or \
-           self.carbohydrates < 0 or self.fat < 0 or \
-           self.fiber < 0 or self.sugar < 0 or \
-           self.sodium < 0:
-            raise ValueError("Nutritional values cannot be negative.")
-
-        if self.serving_size <= 0:
-            raise ValueError("Serving size must be positive.")
-
-        if not self.serving_unit:
-            raise ValueError("Serving unit cannot be empty.")
-
-        if not 0.0 <= self.confidence <= 1.0:
-            raise ValueError("Confidence must be between 0.0 and 1.0.")
+        for field_name, value in values.items():
+            if value < 0:
+                raise ValueError(f"{field_name} cannot be negative.")
