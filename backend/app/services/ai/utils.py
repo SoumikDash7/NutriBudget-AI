@@ -104,7 +104,7 @@ def extract_json(text: str | None) -> dict | None:
 
 NUTRITION_JSON_INSTRUCTIONS = """Return ONLY valid JSON. No markdown. No explanations. No reasoning. No <think> tags. No code fences. No extra text before or after the JSON.
 
-Break the food down into individual ingredients, then give the TOTAL combined nutrition for everything together. Use realistic USDA-style nutrition values where possible.
+Break the food down into individual ingredients. You must NOT calculate calories, protein, carbohydrates, fat, fiber, sugar, or sodium. No nutrition estimation.
 
 For each ingredient:
 - "name": short ingredient name (e.g. "Egg", "Chicken Breast", "Butter")
@@ -121,12 +121,6 @@ Respond with exactly this JSON shape and no other keys:
   "ingredients": [
     {"name": "string", "quantity": number, "unit": "string"}
   ],
-  "total": {
-    "calories": integer,
-    "protein": number,
-    "carbs": number,
-    "fat": number
-  },
   "confidence": number between 0 and 1
 }
 
@@ -137,7 +131,6 @@ Worked example - if the input were "2 eggs, 3 slices bread, 250 ml milk", the co
     {"name": "Bread", "quantity": 3, "unit": "slice"},
     {"name": "Milk", "quantity": 250, "unit": "ml"}
   ],
-  "total": {"calories": 430, "protein": 25, "carbs": 31, "fat": 19},
   "confidence": 0.9
 }
 
@@ -252,30 +245,11 @@ def parse_nutrition_response(parsed: dict | None) -> dict | None:
     if not isinstance(parsed, dict):
         return None
 
-    # ---- totals ----
-    totals_block = parsed.get("total")
-    if not isinstance(totals_block, dict):
-        totals_block = parsed.get("totals")
-    if not isinstance(totals_block, dict):
-        totals_block = parsed  # flat schema fallback
-
-    totals_block = _normalize_keys(totals_block, _TOTAL_KEY_ALIASES)
-
-    required_totals = {"calories", "protein", "carbs", "fat"}
-    if not required_totals.issubset(totals_block.keys()):
-        flat = _normalize_keys(parsed, _TOTAL_KEY_ALIASES)
-        if required_totals.issubset(flat.keys()):
-            totals_block = flat
-        else:
-            return None
-
-    try:
-        calories = float(totals_block["calories"])
-        protein = float(totals_block["protein"])
-        carbs = float(totals_block["carbs"])
-        fat = float(totals_block["fat"])
-    except (TypeError, ValueError):
-        return None
+    # ---- totals (defaulted to 0.0 under the new ingredients-only flow) ----
+    calories = 0.0
+    protein = 0.0
+    carbs = 0.0
+    fat = 0.0
 
     # ---- ingredients ----
     raw_ingredients = parsed.get("ingredients")

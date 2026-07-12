@@ -9,7 +9,7 @@ Ingredients
     ↓
 Ingredient Matcher
     ↓
-Nutrition Provider
+Providers (in priority order — first successful result wins)
     ↓
 Scale Nutrition
     ↓
@@ -18,10 +18,13 @@ Meal Totals
 
 from __future__ import annotations
 
+import logging
+
 from app.services.calculators.food_nutrition.databases import (
     NutritionProvider,
 )
 from app.services.calculators.food_nutrition.exceptions import (
+    IngredientNotFoundError,
     UnsupportedUnitError,
 )
 from app.services.calculators.food_nutrition.matcher import (
@@ -35,21 +38,32 @@ from app.services.calculators.food_nutrition.models import (
     ScaledNutrition,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class NutritionEngine:
     """
     Deterministic nutrition calculation engine.
+
+    Accepts an ordered list of providers.  On each lookup the engine
+    tries providers left-to-right and returns the first successful
+    result.  If all providers raise IngredientNotFoundError the
+    exception from the last provider is propagated.
     """
 
     def __init__(
         self,
-        provider: NutritionProvider,
+        providers: list[NutritionProvider],
         matcher: IngredientMatcher | None = None,
     ) -> None:
-        self._provider = provider
+        if not providers:
+            raise ValueError(
+                "NutritionEngine requires at least one provider."
+            )
+        self._providers = providers
         self._matcher = matcher or IngredientMatcher()
 
-    def analyze(
+    async def analyze(
         self,
         ingredients: list[Ingredient],
     ) -> NutritionResult:
@@ -68,7 +82,7 @@ class NutritionEngine:
 
         for ingredient in ingredients:
             match = self._match(ingredient)
-            nutrition = self._lookup(match)
+            nutrition = await self._lookup(match)
             scaled = self._scale(
                 ingredient,
                 nutrition,
@@ -89,11 +103,33 @@ class NutritionEngine:
     ) -> IngredientMatch:
         return self._matcher.match(ingredient)
 
-    def _lookup(
+    async def _lookup(
         self,
         match: IngredientMatch,
     ) -> NutritionFacts:
-        return self._provider.lookup(match)
+        """
+        Try each provider in priority order.
+
+        Returns the first successful result.
+        Raises IngredientNotFoundError if every provider fails.
+        """
+        last_exc: IngredientNotFoundError | None = None
+
+        for provider in self._providers:
+            try:
+                return await provider.lookup(match)
+            except IngredientNotFoundError as exc:
+                logger.debug(
+                    "Provider %s did not find '%s'; trying next.",
+                    type(provider).__name__,
+                    match.canonical_name,
+                )
+                last_exc = exc
+
+        raise IngredientNotFoundError(
+            f"Ingredient '{match.canonical_name}' "
+            "was not found in any provider."
+        ) from last_exc
 
     def _scale(
         self,
@@ -103,26 +139,46 @@ class NutritionEngine:
         """
         Scale nutrition values to the user supplied quantity.
         """
+        from app.services.calculators.food_nutrition.converter import QuantityConverter
 
-        unit = ingredient.unit.lower()
+        norm_unit = QuantityConverter.normalize_unit(ingredient.unit)
 
-        if unit not in {
-            "g",
-            "gram",
-            "grams",
-        }:
+        # Check if matched in USDA portions
+        has_usda_portion = False
+        if nutrition.food_portions:
+            has_usda_portion = (
+                QuantityConverter._find_usda_portion_match(
+                    norm_unit, nutrition.food_portions
+                )
+                is not None
+            )
+        if (
+            not has_usda_portion
+            and getattr(nutrition, "portions", None)
+        ):
+            has_usda_portion = norm_unit in nutrition.portions
+
+        if (
+            norm_unit not in QuantityConverter._UNIT_NORMALIZATION
+            and not has_usda_portion
+        ):
             raise UnsupportedUnitError(
                 f"Unsupported unit '{ingredient.unit}'."
             )
 
-        factor = (
-            ingredient.quantity
-            / nutrition.serving_size
+        grams = QuantityConverter.convert_to_grams(
+            ingredient.name,
+            ingredient.quantity,
+            ingredient.unit,
+            nutrition,
         )
+
+        factor = grams / 100.00
+        estimated = norm_unit not in {"g", "kg", "oz", "lb"}
 
         return ScaledNutrition(
             ingredient=ingredient,
-            base_nutrition=nutrition,
+            nutrition=nutrition,
             calories=nutrition.calories * factor,
             protein=nutrition.protein * factor,
             carbohydrates=nutrition.carbohydrates * factor,
@@ -130,6 +186,7 @@ class NutritionEngine:
             fiber=nutrition.fiber * factor,
             sugar=nutrition.sugar * factor,
             sodium=nutrition.sodium * factor,
+            estimated_quantity=estimated,
         )
 
     @staticmethod

@@ -60,36 +60,29 @@ class Qwen3Client(NutritionProvider):
                 {
                     "role": "system",
                     "content": (
-                        "You are a nutrition API. "
-                        "Return ONLY valid JSON matching the requested schema. "
-                        "No markdown. "
-                        "No explanations. "
-                        "No <think>. "
-                        "No reasoning of any kind - respond with the final JSON directly. "
-                        "No code fences."
+                        "You are an expert food analyzer. "
+                        "Your job is to identify and extract ingredients, quantities, and units from the meal description. "
+                        "You must NOT calculate calories, protein, carbohydrates, fat, fiber, sugar, or sodium. "
+                        "Return ONLY valid JSON matching the requested schema. No markdown. No explanations."
                     ),
                 },
                 {
-                    # "/no_think" is a documented Qwen3 chat-template hint that suppresses
-                    # its internal reasoning trace even on routers that don't support the
-                    # chat_template_kwargs field below. Harmless no-op on non-Qwen3 models.
                     "role": "user",
-                    "content": prompt + "\n\n/no_think",
+                    "content": (
+                        f"{prompt}\n\n"
+                        "Guidelines:\n"
+                        "- Extract all distinct ingredients.\n"
+                        "- Do not estimate nutrition values or calculate calories/macros.\n"
+                        "\n/no_think"
+                    ),
                 },
             ],
-            "temperature": 0.1,
-            # Raised from 768: the structured ingredients+total schema needs more output
-            # tokens than the old flat schema, and Qwen3's reasoning trace (if the router
-            # doesn't honor enable_thinking=False) can consume a large chunk of the budget
-            # before it ever reaches the JSON - leaving too little room caused truncated,
-            # unparseable output.
+            "temperature": 0.0,
             "max_tokens": 2048,
-            # Standard vLLM/HF-router field for disabling Qwen3's thinking mode.
-            # Ignored harmlessly by routers/models that don't recognize it.
-            "chat_template_kwargs": {"enable_thinking": False},
-        }
-
-        # Try providers in order of verification
+            "chat_template_kwargs": {
+                "enable_thinking": False
+            },
+        }        # Try providers in order of verification
         providers = [
             ("featherless-ai", "https://router.huggingface.co/featherless-ai/v1/chat/completions"),
             ("nscale",         "https://router.huggingface.co/nscale/v1/chat/completions"),

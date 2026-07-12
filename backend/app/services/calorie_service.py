@@ -24,6 +24,7 @@ from datetime import date, timedelta
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import hashlib
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.models.calorie import CalorieLog
@@ -35,6 +36,17 @@ from app.services.ai.gemma_client import GemmaClient
 from app.services.ai.groq_llama_client import GroqLlamaClient
 from app.services.ai.usda_client import USDAClient
 from app.services.ai.orchestrator import AIOrchestrator
+
+from app.core.caching import InMemoryTTLCache
+from app.services.calculators.food_nutrition.engine import NutritionEngine
+from app.services.calculators.food_nutrition.databases import (
+    IndianNutritionProvider,
+    OpenFoodFactsProvider,
+    DeterministicFallbackProvider,
+)
+from app.services.calculators.food_nutrition.providers.usda import USDANutritionProvider
+from app.services.calculators.food_nutrition.models import Ingredient as DomainIngredient
+from app.services.calculators.food_nutrition.converter import QuantityConverter
 
 logger = get_logger(__name__)
 
@@ -118,74 +130,7 @@ class OpenFoodFactsClient:
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Local food database — USDA + Indian cuisine reference values
-# ─────────────────────────────────────────────────────────────────────────────
-
-_LOCAL_FOOD_DB: dict[str, dict] = {
-    # ── Indian Staples ────────────────────────────────────────────────────
-    "roti":           {"food_name": "Roti (1 piece)",              "calories": 80,  "protein": 3.0,  "carbs": 15.0, "fat": 0.5},
-    "chapati":        {"food_name": "Chapati (1 piece)",           "calories": 80,  "protein": 3.0,  "carbs": 15.0, "fat": 0.5},
-    "paratha":        {"food_name": "Aloo Paratha (1 piece)",      "calories": 210, "protein": 4.0,  "carbs": 32.0, "fat": 7.0},
-    "naan":           {"food_name": "Naan (1 piece)",              "calories": 260, "protein": 9.0,  "carbs": 45.0, "fat": 5.0},
-    "poori":          {"food_name": "Puri (1 piece)",              "calories": 120, "protein": 2.0,  "carbs": 14.0, "fat": 6.0},
-    "idli":           {"food_name": "Idli (1 piece)",              "calories": 40,  "protein": 1.0,  "carbs": 8.0,  "fat": 0.1},
-    "dosa":           {"food_name": "Plain Dosa (1 piece)",        "calories": 120, "protein": 2.0,  "carbs": 22.0, "fat": 3.0},
-    "uttapam":        {"food_name": "Uttapam (1 piece)",           "calories": 110, "protein": 3.5,  "carbs": 18.0, "fat": 3.0},
-    "upma":           {"food_name": "Upma (100g)",                 "calories": 130, "protein": 3.0,  "carbs": 22.0, "fat": 4.5},
-    "poha":           {"food_name": "Poha (100g)",                 "calories": 110, "protein": 2.5,  "carbs": 23.0, "fat": 2.0},
-    "khichdi":        {"food_name": "Khichdi (100g)",              "calories": 120, "protein": 4.5,  "carbs": 20.0, "fat": 3.0},
-    # ── Indian Curries & Mains ────────────────────────────────────────────
-    "dal":            {"food_name": "Dal Tadka (100g)",            "calories": 120, "protein": 5.0,  "carbs": 15.0, "fat": 4.0},
-    "dal makhani":    {"food_name": "Dal Makhani (100g)",          "calories": 165, "protein": 6.5,  "carbs": 18.0, "fat": 7.0},
-    "paneer":         {"food_name": "Paneer Butter Masala (100g)", "calories": 229, "protein": 8.0,  "carbs": 6.0,  "fat": 19.0},
-    "palak paneer":   {"food_name": "Palak Paneer (100g)",         "calories": 180, "protein": 7.0,  "carbs": 8.0,  "fat": 13.0},
-    "butter chicken": {"food_name": "Butter Chicken (100g)",       "calories": 240, "protein": 14.0, "carbs": 5.0,  "fat": 18.0},
-    "chicken tikka":  {"food_name": "Chicken Tikka (100g)",        "calories": 190, "protein": 22.0, "carbs": 4.0,  "fat": 9.0},
-    "biryani":        {"food_name": "Chicken Biryani (100g)",      "calories": 180, "protein": 10.0, "carbs": 22.0, "fat": 6.0},
-    "rajma":          {"food_name": "Rajma Masala (100g)",         "calories": 140, "protein": 7.5,  "carbs": 22.0, "fat": 3.5},
-    "chole":          {"food_name": "Chole Masala (100g)",         "calories": 160, "protein": 7.0,  "carbs": 24.0, "fat": 5.0},
-    "aloo gobi":      {"food_name": "Aloo Gobi (100g)",            "calories": 90,  "protein": 2.5,  "carbs": 12.0, "fat": 4.0},
-    "sambhar":        {"food_name": "Sambar (100g)",               "calories": 75,  "protein": 3.5,  "carbs": 10.0, "fat": 2.5},
-    "rasam":          {"food_name": "Rasam (100ml)",               "calories": 40,  "protein": 1.5,  "carbs": 6.0,  "fat": 1.0},
-    # ── Indian Snacks & Street Food ───────────────────────────────────────
-    "samosa":         {"food_name": "Samosa (1 piece)",            "calories": 260, "protein": 3.5,  "carbs": 24.0, "fat": 16.0},
-    "pakora":         {"food_name": "Pakora (1 piece)",            "calories": 80,  "protein": 2.0,  "carbs": 9.0,  "fat": 4.0},
-    "vada":           {"food_name": "Medu Vada (1 piece)",         "calories": 100, "protein": 3.0,  "carbs": 12.0, "fat": 5.0},
-    "pani puri":      {"food_name": "Pani Puri (6 pieces)",        "calories": 180, "protein": 3.0,  "carbs": 28.0, "fat": 6.0},
-    "bhel puri":      {"food_name": "Bhel Puri (100g)",            "calories": 130, "protein": 3.0,  "carbs": 22.0, "fat": 4.0},
-    "pav bhaji":      {"food_name": "Pav Bhaji (1 serving)",       "calories": 350, "protein": 8.0,  "carbs": 52.0, "fat": 12.0},
-    # ── Indian Sweets & Drinks ────────────────────────────────────────────
-    "gulab jamun":    {"food_name": "Gulab Jamun (1 piece)",       "calories": 150, "protein": 2.5,  "carbs": 26.0, "fat": 5.0},
-    "rasgulla":       {"food_name": "Rasgulla (1 piece)",          "calories": 100, "protein": 2.0,  "carbs": 22.0, "fat": 0.5},
-    "halwa":          {"food_name": "Sooji Halwa (100g)",          "calories": 280, "protein": 4.0,  "carbs": 38.0, "fat": 12.0},
-    "kheer":          {"food_name": "Rice Kheer (100g)",           "calories": 145, "protein": 3.5,  "carbs": 24.0, "fat": 4.5},
-    "lassi":          {"food_name": "Sweet Lassi (200ml)",         "calories": 160, "protein": 5.0,  "carbs": 26.0, "fat": 4.0},
-    "chai":           {"food_name": "Masala Chai with milk (200ml)","calories": 80, "protein": 2.5,  "carbs": 11.0, "fat": 2.5},
-    # ── International Staples (USDA Reference) ───────────────────────────
-    "egg":            {"food_name": "Egg (1 large)",               "calories": 70,  "protein": 6.0,  "carbs": 0.6,  "fat": 5.0},
-    "eggs":           {"food_name": "Eggs (1 large each)",         "calories": 70,  "protein": 6.0,  "carbs": 0.6,  "fat": 5.0},
-    "omelette":       {"food_name": "Plain Omelette (2 eggs)",     "calories": 190, "protein": 13.0, "carbs": 1.0,  "fat": 15.0},
-    "bread":          {"food_name": "Slice of Bread",              "calories": 80,  "protein": 3.0,  "carbs": 15.0, "fat": 1.0},
-    "banana":         {"food_name": "Banana (medium)",             "calories": 90,  "protein": 1.1,  "carbs": 23.0, "fat": 0.3},
-    "apple":          {"food_name": "Apple (medium)",              "calories": 52,  "protein": 0.3,  "carbs": 14.0, "fat": 0.2},
-    "orange":         {"food_name": "Orange (medium)",             "calories": 62,  "protein": 1.2,  "carbs": 15.4, "fat": 0.2},
-    "mango":          {"food_name": "Mango (100g)",                "calories": 60,  "protein": 0.8,  "carbs": 15.0, "fat": 0.4},
-    "chicken":        {"food_name": "Chicken Breast (100g)",       "calories": 165, "protein": 31.0, "carbs": 0.0,  "fat": 3.6},
-    "fish":           {"food_name": "Grilled Fish (100g)",         "calories": 140, "protein": 26.0, "carbs": 0.0,  "fat": 4.0},
-    "rice":           {"food_name": "Cooked Rice (100g)",          "calories": 130, "protein": 2.7,  "carbs": 28.0, "fat": 0.3},
-    "pasta":          {"food_name": "Cooked Pasta (100g)",         "calories": 158, "protein": 5.8,  "carbs": 31.0, "fat": 0.9},
-    "oats":           {"food_name": "Oatmeal (100g cooked)",       "calories": 71,  "protein": 2.5,  "carbs": 12.0, "fat": 1.5},
-    "milk":           {"food_name": "Milk (200ml)",                "calories": 120, "protein": 6.8,  "carbs": 10.0, "fat": 6.0},
-    "curd":           {"food_name": "Curd / Yogurt (100g)",        "calories": 60,  "protein": 3.5,  "carbs": 4.5,  "fat": 3.0},
-    "paneer raw":     {"food_name": "Paneer (100g raw)",           "calories": 265, "protein": 18.0, "carbs": 3.5,  "fat": 20.0},
-    "pizza":          {"food_name": "Slice of Pizza",              "calories": 285, "protein": 12.0, "carbs": 36.0, "fat": 10.0},
-    "burger":         {"food_name": "Burger (standard)",           "calories": 350, "protein": 18.0, "carbs": 40.0, "fat": 14.0},
-    "salad":          {"food_name": "Green Salad",                 "calories": 15,  "protein": 1.0,  "carbs": 3.0,  "fat": 0.2},
-    "sandwich":       {"food_name": "Sandwich (standard)",         "calories": 250, "protein": 11.0, "carbs": 34.0, "fat": 8.0},
-    "coffee":         {"food_name": "Coffee with milk (200ml)",    "calories": 50,  "protein": 2.0,  "carbs": 5.0,  "fat": 2.0},
-    "juice":          {"food_name": "Fruit Juice (200ml)",         "calories": 90,  "protein": 0.5,  "carbs": 22.0, "fat": 0.0},
-}
+from app.services.calculators.food_nutrition.constants import _LOCAL_FOOD_DB
 
 
 class _FallbackOFFClient:
@@ -237,6 +182,17 @@ class CalorieService:
         # OpenFoodFacts uses the same shared client (falls back to per-request only if client not injected)
         self.off_client   = OpenFoodFactsClient(http_client) if http_client else _FallbackOFFClient()
         self.orchestrator = _build_orchestrator()
+        
+        client = http_client if http_client is not None else httpx.AsyncClient()
+        self.engine = NutritionEngine(
+            providers=[
+                USDANutritionProvider(client),
+                IndianNutritionProvider(),
+                OpenFoodFactsProvider(client),
+                DeterministicFallbackProvider(),
+            ]
+        )
+        self.ingredients_cache = InMemoryTTLCache(default_ttl_seconds=86400)
 
     # ── Food Logging ──────────────────────────────────────────────────────
 
@@ -327,132 +283,123 @@ class CalorieService:
           1. AIOrchestrator text chain (Qwen3 -> Gemma -> Groq -> USDA)
           2. Local DB (Indian + international) - offline database lookup fallback
           3. Open Food Facts search - product lookup fallback
-
-        IMPORTANT: any leading number in the description (e.g. "2 rotis") is
-        parsed ONLY as a serving-count hint for the Local DB fallback (Step 2),
-        where reference values are stored per single unit. It is deliberately
-        NOT applied to the AI orchestrator result (Step 1): the orchestrator
-        receives the full original description and already returns TOTAL
-        nutrition for whatever quantity/weight was described - e.g.
-        "250 g chicken with 20 g butter" comes back as the total for that
-        250g + 20g, not a per-unit figure that needs multiplying again.
-        Multiplying it again by 250 would be the exact quantity-multiplication
-        bug this pipeline is designed to avoid.
         """
         logger.info(f"parse_description: '{description}'")
         desc_lower = description.lower().strip()
 
-        # Leading integer, used ONLY by the Local DB fallback (Step 2) below.
+        # Leading integer, used ONLY by the Local DB fallback below.
         quantity  = 1
         num_match = re.match(r"^(\d+)\s+(.+)$", desc_lower)
         if num_match and not _WEIGHT_UNIT_PATTERN.match(num_match.group(2)):
             quantity   = int(num_match.group(1))
             food_query = num_match.group(2)
-            logger.debug(
-                f"Leading serving-count detected: {quantity}x '{food_query}' "
-                f"(Local DB fallback only - not applied to AI result)"
-            )
         else:
             food_query = desc_lower
-            if num_match:
-                logger.debug(
-                    "Leading number looks like a weight/volume amount, not a "
-                    "serving count - ignoring as multiplier"
-                )
 
-        # ── 1. Orchestrated AI Pipeline (Qwen3 -> Gemma -> Groq -> USDA) ──
-        logger.debug("Step 1/3: AIOrchestrator text parse")
-        if not self.http_client:
-            logger.error("parse_description called without http_client")
-            raise ValueError("http_client is required for AI description parsing.")
+        ai_ingredients = None
+        confidence = 0.90
 
-        sanitized_description = self._sanitize_description(description)
+        # ── 1. AI Orchestrator ──
+        if self.http_client:
+            sanitized_description = self._sanitize_description(description)
+            try:
+                result = await self.orchestrator.parse_text(sanitized_description, self.http_client)
+                if result and result.ingredients:
+                    ai_ingredients = result.ingredients
+                    confidence = result.confidence
+            except Exception as e:
+                logger.warning(f"AIOrchestrator text parse failed: {e}")
 
-        try:
-            result = await self.orchestrator.parse_text(sanitized_description, self.http_client)
-            if result:
-                # Surface every parsed ingredient, not just the first one - a combined
-                # description like "500g chicken with butter, roti, and lime soda" should
-                # produce a food_name that reflects all items, and the raw per-ingredient
-                # breakdown should still be available to the caller (e.g. for display or
-                # editing), rather than being silently dropped after the first entry.
-                if result.ingredients:
-                    if len(result.ingredients) == 1:
-                        name = result.ingredients[0].name
+        is_fallback_db = False
+        fallback_db_name = None
+
+        if ai_ingredients is not None:
+            ingredients = [
+                DomainIngredient(name=ing.name, quantity=ing.quantity, unit=ing.unit)
+                for ing in ai_ingredients
+            ]
+        else:
+            logger.debug("AI orchestrator failed or returned no ingredients - falling back to databases")
+
+            # ── 2. Local food database ──
+            matched_db = False
+            for keyword, base_data in _LOCAL_FOOD_DB.items():
+                if keyword in food_query:
+                    logger.info(f"Fallback Local DB match: keyword='{keyword}' > {base_data['food_name']}")
+                    ingredients = [
+                        DomainIngredient(name=base_data["food_name"], quantity=float(quantity), unit="piece" if "piece" in base_data["food_name"].lower() else "serving")
+                    ]
+                    confidence = 0.90
+                    matched_db = True
+                    is_fallback_db = True
+                    fallback_db_name = f"{quantity}x {base_data['food_name']}" if quantity > 1 else base_data["food_name"]
+                    break
+
+            # ── 3. Open Food Facts search ──
+            if not matched_db:
+                try:
+                    off_results = await self.off_client.search_products(description)
+                    relevant = self._filter_relevant_off_results(description, off_results)
+                    if relevant:
+                        top = relevant[0]
+                        logger.info(f"Fallback OpenFoodFacts match: {top['food_name']}")
+                        ingredients = [
+                            DomainIngredient(name=top["food_name"], quantity=1.0, unit="serving")
+                        ]
+                        confidence = 0.80
                     else:
-                        name = ", ".join(ing.name for ing in result.ingredients)
-                else:
-                    name = "Unknown Food"
+                        raise ValueError("No relevant OpenFoodFacts results")
+                except Exception as e:
+                    logger.warning(f"Fallback OpenFoodFacts search failed: {e}")
+                    raise ValueError(f"Failed to parse food description '{description}'. All fallback steps failed.")
 
-                validated = self._validate_nutrition(
-                    calories=result.calories,
-                    protein=result.protein_g,
-                    carbs=result.carbs_g,
-                    fat=result.fat_g,
-                    source="AIOrchestrator",
-                )
-                if validated is not None:
-                    logger.info(f"Step 1 OK AIOrchestrator: {name} ({validated['calories']} kcal)")
-                    return {
-                        "food_name": name,
-                        "calories": validated["calories"],
-                        "protein": validated["protein"],
-                        "carbs": validated["carbs"],
-                        "fat": validated["fat"],
-                        "confidence": result.confidence,
-                        "ingredients": [
-                            {"name": ing.name, "quantity": ing.quantity, "unit": ing.unit}
-                            for ing in result.ingredients
-                        ],
-                    }
-                logger.warning("Step 1: AIOrchestrator result failed nutrition validation - falling back")
-        except Exception as e:
-            logger.warning(f"AIOrchestrator text parse failed: {e}")
+        # Caching logic based on normalized ingredient list hash
+        normalized_strings = []
+        for ing in ingredients:
+            canonical_name = self.engine._matcher.match(ing).canonical_name
+            norm_unit = QuantityConverter.normalize_unit(ing.unit)
+            normalized_strings.append(f"{canonical_name} {ing.quantity} {norm_unit}")
 
-        logger.debug("AI orchestrator failed - falling back to databases")
+        normalized_strings.sort()
+        normalized_str = ",".join(normalized_strings)
+        cache_key = hashlib.sha256(normalized_str.encode("utf-8")).hexdigest()
 
-        # ── 2. Local food database ────────────────────────────────────────
-        logger.debug("Step 2/3: local food DB keyword match")
-        for keyword, base_data in _LOCAL_FOOD_DB.items():
-            if keyword in food_query:
-                logger.info(f"Step 2 OK Local DB: keyword='{keyword}' > {base_data['food_name']}")
-                return {
-                    "food_name": f"{quantity}x {base_data['food_name']}" if quantity > 1 else base_data["food_name"],
-                    "calories":  base_data["calories"] * quantity,
-                    "protein":   round(base_data["protein"] * quantity, 1),
-                    "carbs":     round(base_data["carbs"]   * quantity, 1),
-                    "fat":       round(base_data["fat"]     * quantity, 1),
-                    "confidence": 0.90,
-                }
-        logger.debug("Step 2: no local DB keyword match")
+        cached = self.ingredients_cache.get(cache_key)
+        if cached is not None:
+            logger.info("Ingredients cache hit! Returning deterministic cached nutrition.")
+            return cached
 
-        # ── 3. Open Food Facts search ─────────────────────────────────────
-        logger.debug("Step 3/3: Open Food Facts product search")
+        # Run ingredients through the engine
         try:
-            off_results = await self.off_client.search_products(description)
-            relevant = self._filter_relevant_off_results(description, off_results)
-            if relevant:
-                top = relevant[0]
-                logger.info(f"Step 3 OK OpenFoodFacts: {top['food_name']} ({top['calories']} kcal)")
-                return {**top, "confidence": 0.80}
-            elif off_results:
-                logger.debug("Step 3: Open Food Facts returned results but none passed relevance threshold")
-            else:
-                logger.debug("Step 3: Open Food Facts returned no usable results")
+            analysis = await self.engine.analyze(ingredients)
         except Exception as e:
-            logger.warning(f"Step 3 FAIL Open Food Facts error: {e}")
+            logger.error(f"NutritionEngine analysis failed: {e}")
+            raise ValueError(f"Failed to parse food description: {e}")
 
-        # All parsers exhausted
-        logger.error(f"All 3 text parsing steps failed for '{description}'.")
-        raise ValueError(f"Failed to parse food description '{description}'. All fallback steps failed.")
+        # Construct final food_name
+        if is_fallback_db:
+            food_name = fallback_db_name
+        else:
+            if len(ingredients) == 1:
+                food_name = ingredients[0].name
+            else:
+                food_name = ", ".join(ing.name for ing in ingredients)
 
-    # ── Barcode Lookup ────────────────────────────────────────────────────
+        response = {
+            "food_name": food_name,
+            "calories": int(analysis.total_calories),
+            "protein": round(analysis.total_protein, 1),
+            "carbs": round(analysis.total_carbohydrates, 1),
+            "fat": round(analysis.total_fat, 1),
+            "confidence": confidence,
+            "ingredients": [
+                {"name": ing.name, "quantity": ing.quantity, "unit": ing.unit}
+                for ing in ingredients
+            ]
+        }
 
-    async def lookup_barcode(self, barcode: str) -> dict | None:
-        logger.info(f"lookup_barcode: '{barcode}'")
-        return await self.off_client.lookup_barcode(barcode)
-
-    # ── Image Scanner ─────────────────────────────────────────────────────
+        self.ingredients_cache.set(cache_key, response)
+        return response
 
     async def scan_image(self, filename: str, file_bytes: bytes | None = None) -> dict:
         """
@@ -471,67 +418,103 @@ class CalorieService:
         logger.debug(f"Image size: {len(file_bytes):,} bytes")
         errors = []
 
+        ai_ingredients = None
+        confidence = 0.90
+
         # ── 1. Orchestrated AI Vision (Qwen VL -> Gemma -> Groq) ──────
-        logger.debug("Step 1/2: AIOrchestrator Vision scan")
-        if not self.http_client:
-            logger.error("scan_image called without http_client")
-            raise ValueError("http_client is required for AI image scanning.")
+        if self.http_client:
+            base64_img = base64.b64encode(file_bytes).decode("utf-8")
+            try:
+                result = await self.orchestrator.parse_image(base64_img, self.http_client, filename=filename)
+                if result and result.ingredients:
+                    ai_ingredients = result.ingredients
+                    confidence = result.confidence
+            except Exception as e:
+                err_msg = f"AIOrchestrator Vision failed: {e}"
+                logger.warning(f"AIOrchestrator Vision failed: {e}")
+                errors.append(err_msg)
 
-        base64_img = base64.b64encode(file_bytes).decode("utf-8")
+        is_heuristic = False
+
+        if ai_ingredients is not None:
+            ingredients = [
+                DomainIngredient(name=ing.name, quantity=ing.quantity, unit=ing.unit)
+                for ing in ai_ingredients
+            ]
+        else:
+            # ── 2. Filename heuristic ──
+            logger.debug("Step 2/2: filename heuristic")
+            matched_keyword = None
+            for keyword in _LOCAL_FOOD_DB:
+                if keyword in filename.lower():
+                    matched_keyword = keyword
+                    break
+
+            if matched_keyword:
+                logger.info(f"Heuristic matched keyword: '{matched_keyword}'")
+                ingredients = [
+                    DomainIngredient(name=_LOCAL_FOOD_DB[matched_keyword]["food_name"], quantity=1.0, unit="serving")
+                ]
+                confidence = 0.85
+                is_heuristic = True
+            else:
+                combined_error = " | ".join(errors)
+                logger.error(f"All image scan steps failed for '{filename}'. Details: {combined_error}")
+                raise ValueError(f"AI image scanning failed: {combined_error}")
+
+        # Caching logic
+        normalized_strings = []
+        for ing in ingredients:
+            canonical_name = self.engine._matcher.match(ing).canonical_name
+            norm_unit = QuantityConverter.normalize_unit(ing.unit)
+            normalized_strings.append(f"{canonical_name} {ing.quantity} {norm_unit}")
+
+        normalized_strings.sort()
+        normalized_str = ",".join(normalized_strings)
+        cache_key = hashlib.sha256(normalized_str.encode("utf-8")).hexdigest()
+
+        cached = self.ingredients_cache.get(cache_key)
+        if cached is not None:
+            logger.info("Ingredients cache hit for scan_image! Returning deterministic cached nutrition.")
+            return cached
+
+        # Run ingredients through the engine
         try:
-            result = await self.orchestrator.parse_image(base64_img, self.http_client, filename=filename)
-            if result:
-                if result.ingredients:
-                    if len(result.ingredients) == 1:
-                        name = result.ingredients[0].name
-                    else:
-                        name = ", ".join(ing.name for ing in result.ingredients)
-                else:
-                    name = "Scanned Food"
-
-                validated = self._validate_nutrition(
-                    calories=result.calories,
-                    protein=result.protein_g,
-                    carbs=result.carbs_g,
-                    fat=result.fat_g,
-                    source="AIOrchestrator Vision",
-                )
-                if validated is not None:
-                    logger.info(f"Step 1 OK Orchestrator Vision: {name} ({validated['calories']} kcal)")
-                    return {
-                        "food_name": name,
-                        "calories": validated["calories"],
-                        "protein": validated["protein"],
-                        "carbs": validated["carbs"],
-                        "fat": validated["fat"],
-                        "confidence": result.confidence,
-                        "ingredients": [
-                            {"name": ing.name, "quantity": ing.quantity, "unit": ing.unit}
-                            for ing in result.ingredients
-                        ],
-                    }
-                logger.warning("Step 1: Vision result failed nutrition validation - falling back")
+            analysis = await self.engine.analyze(ingredients)
         except Exception as e:
-            err_msg = f"AIOrchestrator Vision failed: {e}"
-            logger.warning(f"Step 1 FAIL {err_msg}")
-            errors.append(err_msg)
+            logger.error(f"NutritionEngine analysis failed in scan_image: {e}")
+            raise ValueError(f"AI image scanning failed: {e}")
 
-        # ── 2. Filename heuristic ──────────────────────────────────────
-        logger.debug("Step 2/2: filename heuristic")
-        heuristic_result = self._filename_heuristic(filename)
-        if heuristic_result:
-            logger.info(
-                f"Step 2 OK Heuristic: '{filename}' > "
-                f"{heuristic_result['food_name']} (confidence={heuristic_result['confidence']})"
-            )
-            return heuristic_result
+        # Construct final food_name
+        if is_heuristic:
+            food_name = f"Scanned {ingredients[0].name}"
+        else:
+            if len(ingredients) == 1:
+                food_name = ingredients[0].name
+            else:
+                food_name = ", ".join(ing.name for ing in ingredients)
 
-        logger.debug("Step 2: heuristic found no match")
+        response = {
+            "food_name": food_name,
+            "calories": int(analysis.total_calories),
+            "protein": round(analysis.total_protein, 1),
+            "carbs": round(analysis.total_carbohydrates, 1),
+            "fat": round(analysis.total_fat, 1),
+            "confidence": confidence,
+            "ingredients": [
+                {"name": ing.name, "quantity": ing.quantity, "unit": ing.unit}
+                for ing in ingredients
+            ]
+        }
 
-        # All layers failed
-        combined_error = " | ".join(errors)
-        logger.error(f"All image scan steps failed for '{filename}'. Details: {combined_error}")
-        raise ValueError(f"AI image scanning failed: {combined_error}")
+        self.ingredients_cache.set(cache_key, response)
+        return response
+
+    # ── Barcode Lookup ────────────────────────────────────────────────────
+
+    async def lookup_barcode(self, barcode: str) -> dict | None:
+        logger.info(f"lookup_barcode: '{barcode}'")
+        return await self.off_client.lookup_barcode(barcode)
 
     # ─────────────────────────────────────────────────────────────────────
     # Private helpers

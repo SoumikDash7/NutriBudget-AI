@@ -13,22 +13,28 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.schemas.nutrition import FoodInput, NutritionEstimate, ExtractedIngredient
 from app.services.ai.base import NutritionProvider
-from app.services.ai.utils import extract_json, detect_mime
+from app.services.ai.utils import extract_json, detect_mime, build_vision_prompt, parse_nutrition_response
 from app.services.ai.exceptions import ProviderAPIError
 
 logger = get_logger(__name__)
 
-_VISION_PROMPT = (
-    "You are a professional nutrition analyst. Carefully examine this food image. "
-    "Identify ALL visible food items (e.g. rice, curry, bread, drinks). "
-    "Estimate the TOTAL combined nutrition for everything on the plate or in the image. "
-    "Return ONLY a valid JSON object with exactly these keys -- no markdown, no extra text:\n"
-    "{\"food_name\": \"<descriptive combined name>\", "
-    "\"calories\": <integer kcal>, "
-    "\"protein\": <float grams>, "
-    "\"carbs\": <float grams>, "
-    "\"fat\": <float grams>}"
-)
+_DEFAULT_CONFIDENCE = 0.95
+
+
+def _to_nutrition_estimate(normalized: dict, source_provider: str, default_confidence: float) -> NutritionEstimate:
+    confidence = normalized["confidence"] if normalized["confidence"] is not None else default_confidence
+    return NutritionEstimate(
+        ingredients=[
+            ExtractedIngredient(name=ing["name"], quantity=ing["quantity"], unit=ing["unit"])
+            for ing in normalized["ingredients"]
+        ],
+        calories=normalized["calories"],
+        protein_g=normalized["protein"],
+        carbs_g=normalized["carbs"],
+        fat_g=normalized["fat"],
+        confidence=confidence,
+        source_provider=source_provider,
+    )
 
 
 class QwenVLClient(NutritionProvider):
@@ -87,9 +93,9 @@ class QwenVLClient(NutritionProvider):
             "model": "Qwen/Qwen2.5-VL-7B-Instruct",
             "messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_img}"}},
-                {"type": "text", "text": _VISION_PROMPT},
+                {"type": "text", "text": build_vision_prompt()},
             ]}],
-            "max_tokens": 256,
+            "max_tokens": 512,
             "temperature": 0.1,
         }
         for provider_name, url in providers:
@@ -99,19 +105,12 @@ class QwenVLClient(NutritionProvider):
                 if response.status_code == 200:
                     data = response.json()
                     text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    parsed = extract_json(text)
-                    required = {"food_name", "calories", "protein", "carbs", "fat"}
-                    if parsed and required.issubset(parsed.keys()):
-                        logger.info(f"HF/{provider_name}: ok {parsed['food_name']} ({parsed['calories']} kcal)")
-                        return NutritionEstimate(
-                            ingredients=[ExtractedIngredient(name=parsed["food_name"], quantity=1.0, unit="serving")],
-                            calories=float(parsed["calories"]),
-                            protein_g=float(parsed["protein"]),
-                            carbs_g=float(parsed["carbs"]),
-                            fat_g=float(parsed["fat"]),
-                            confidence=0.95,
-                            source_provider=f"QwenVL ({provider_name})"
-                        )
+                    raw_parsed = extract_json(text)
+                    normalized = parse_nutrition_response(raw_parsed)
+                    if normalized:
+                        ingredient_names = ", ".join(i["name"] for i in normalized["ingredients"])
+                        logger.info(f"HF/{provider_name}: ok [{ingredient_names}] ({normalized['calories']} kcal total)")
+                        return _to_nutrition_estimate(normalized, f"QwenVL ({provider_name})", _DEFAULT_CONFIDENCE)
                     else:
                         logger.warning(f"HF/{provider_name}: JSON extraction failed. Raw: '{text[:200]}'")
                 else:
@@ -125,7 +124,7 @@ class QwenVLClient(NutritionProvider):
         logger.debug(f"Ollama: POST -> {url}  model={settings.OLLAMA_VISION_MODEL}")
         payload = {
             "model": settings.OLLAMA_VISION_MODEL,
-            "messages": [{"role": "user", "content": _VISION_PROMPT, "images": [base64_img]}],
+            "messages": [{"role": "user", "content": build_vision_prompt(), "images": [base64_img]}],
             "stream": False,
             "options": {"temperature": 0.1},
         }
@@ -134,19 +133,12 @@ class QwenVLClient(NutritionProvider):
             if response.status_code == 200:
                 data = response.json()
                 text = data.get("message", {}).get("content", "")
-                parsed = extract_json(text)
-                required = {"food_name", "calories", "protein", "carbs", "fat"}
-                if parsed and required.issubset(parsed.keys()):
-                    logger.info(f"Ollama: ok {parsed['food_name']} ({parsed['calories']} kcal)")
-                    return NutritionEstimate(
-                        ingredients=[ExtractedIngredient(name=parsed["food_name"], quantity=1.0, unit="serving")],
-                        calories=float(parsed["calories"]),
-                        protein_g=float(parsed["protein"]),
-                        carbs_g=float(parsed["carbs"]),
-                        fat_g=float(parsed["fat"]),
-                        confidence=0.95,
-                        source_provider="Ollama (Local QwenVL)"
-                    )
+                raw_parsed = extract_json(text)
+                normalized = parse_nutrition_response(raw_parsed)
+                if normalized:
+                    ingredient_names = ", ".join(i["name"] for i in normalized["ingredients"])
+                    logger.info(f"Ollama: ok [{ingredient_names}] ({normalized['calories']} kcal total)")
+                    return _to_nutrition_estimate(normalized, "Ollama (Local QwenVL)", _DEFAULT_CONFIDENCE)
                 else:
                     logger.warning(f"Ollama: JSON extraction failed. Raw: '{text[:200]}'")
             else:

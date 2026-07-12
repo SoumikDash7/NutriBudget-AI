@@ -99,6 +99,50 @@ class IngredientMatch:
 
 
 @dataclass(slots=True)
+class FoodPortion:
+    """
+    A single portion definition for a food item.
+
+    Contains only the data required for quantity conversion:
+    mapping a human-readable portion label to a gram weight.
+
+    Attributes:
+        description:
+            Human-readable portion label as stored in the source
+            database (e.g. "1 cup", "1 tablespoon", "1 oz").
+            Used to match against user-supplied unit strings.
+
+        gram_weight:
+            Gram equivalent of this portion.
+            This is the conversion factor used to scale nutrition
+            values when the user supplies a non-gram quantity.
+
+        modifier:
+            Optional secondary qualifier supplied by the source
+            database (e.g. "cooked", "drained", "without skin").
+            Not all providers populate this field.
+    """
+
+    description: str
+    gram_weight: float
+    modifier: str | None = None
+
+    def __post_init__(self) -> None:
+        self.description = self.description.strip()
+
+        if not self.description:
+            raise ValueError("FoodPortion description cannot be empty.")
+
+        if self.gram_weight <= 0:
+            raise ValueError(
+                "FoodPortion gram_weight must be greater than zero."
+            )
+
+        if self.modifier is not None:
+            self.modifier = self.modifier.strip() or None
+
+
+@dataclass(slots=True)
 class NutritionFacts:
     """
     Nutritional values for a standardized serving.
@@ -124,6 +168,55 @@ class NutritionFacts:
     sodium: float
 
     serving_unit: str = "g"
+
+    portions: dict[str, float] = field(default_factory=dict)
+    """
+    Optional real per-food gram weights for specific units, sourced
+    from the provider (e.g. USDA FDC's `foodPortions`).
+
+    Keys are canonical unit strings matching
+    `QuantityConverter.normalize_unit()` output (e.g. "cup", "piece",
+    "tbsp"). Values are grams for one of that unit, *for this specific
+    food* — not a generic density/weight guess.
+
+    Empty dict (the default) means the provider has no portion data;
+    QuantityConverter then falls back to its generic density/weight
+    tables.
+    """
+
+    food_portions: list[FoodPortion] | None = None
+    """
+    Optional structured portion data sourced from the provider.
+
+    Each entry maps a human-readable label (e.g. "1 cup") to its
+    gram weight for this specific food item. Defaults to None when
+    the provider has no portion data available.
+
+    Not used by the engine in Step 2 — carried for future use.
+    """
+
+    # ── Optional micronutrients (all per 100 g, None = not available) ──────
+
+    potassium: float | None = None
+    """Potassium in mg per 100 g."""
+
+    calcium: float | None = None
+    """Calcium in mg per 100 g."""
+
+    iron: float | None = None
+    """Iron in mg per 100 g."""
+
+    vitamin_a: float | None = None
+    """Vitamin A in µg RAE per 100 g."""
+
+    vitamin_c: float | None = None
+    """Vitamin C in mg per 100 g."""
+
+    vitamin_d: float | None = None
+    """Vitamin D in µg per 100 g."""
+
+    vitamin_b12: float | None = None
+    """Vitamin B12 in µg per 100 g."""
 
     def __post_init__(self) -> None:
         self.food_name = self.food_name.strip()
@@ -216,6 +309,14 @@ class ScaledNutrition:
     sugar: float
 
     sodium: float
+
+    estimated_quantity: bool = False
+    """
+    True if converting this ingredient's quantity/unit into grams
+    required a default density or default item weight rather than an
+    exact mass conversion (e.g. "1 cup olive oil" or "2 pieces
+    banana"). False for unambiguous mass units (g, kg, oz, lb).
+    """
 
     def __post_init__(self) -> None:
         values = {

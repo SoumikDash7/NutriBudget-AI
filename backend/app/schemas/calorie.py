@@ -44,6 +44,13 @@ class FoodParseRequest(BaseModel):
     description: str = Field(..., min_length=1)
 
 
+class ExtractedIngredientResponse(BaseModel):
+    """Per-ingredient breakdown surfaced from the AI orchestrator/local DB/OFF results."""
+    name: str
+    quantity: float = 1.0
+    unit: str = "serving"
+
+
 class FoodScanResponse(BaseModel):
     food_name: str
     calories: int
@@ -51,6 +58,11 @@ class FoodScanResponse(BaseModel):
     carbs: float
     fat: float
     confidence: float = 1.0
+    # Optional so existing callers (Local DB fallback, OFF search, barcode lookup)
+    # that don't populate a per-ingredient breakdown still validate cleanly -
+    # they'll just come back as an empty list rather than failing response
+    # validation or getting silently stripped like before this field existed.
+    ingredients: list[ExtractedIngredientResponse] = Field(default_factory=list)
 
 
 class BarcodeScanRequest(BaseModel):

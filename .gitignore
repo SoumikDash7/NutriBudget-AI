@@ -36,3 +36,7 @@ Thumbs.db
 
 # Archives
 *.zip
+
+# Local notebooks
+test.ipynb
+.ipynb_checkpoints/
